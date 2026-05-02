@@ -1,0 +1,8 @@
+{
+  "domain": "your.domain.com",
+  "admin_base": "https://your.domain.com",
+  "admin_user": "admin",
+  "admin_pass": "runtime-only-password-do-not-store-for-gui",
+  "admin_totp_secret": "",
+  "state_file": "tools/.pin_sync_state.json"
+}
