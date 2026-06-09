@@ -17,6 +17,15 @@ def _clean_env_secret(name: str, default: str = "") -> str:
 
 
 SERVER_IDENTITY_SALT = os.getenv("SERVER_IDENTITY_SALT", "REPLACE_THIS_WITH_A_SECURE_LONG_RANDOM_STRING_FOR_YOUR_SERVER")
+_DEFAULT_SERVER_IDENTITY_SALT = "REPLACE_THIS_WITH_A_SECURE_LONG_RANDOM_STRING_FOR_YOUR_SERVER"
+if SERVER_IDENTITY_SALT == _DEFAULT_SERVER_IDENTITY_SALT:
+    # The salt keys the username_hash -> identity HMAC. Leaving it at the shipped
+    # placeholder makes identity mapping predictable (offline precomputation /
+    # user enumeration). Warn loudly so operators rotate it before going live.
+    print(
+        "[SECURITY WARNING] SERVER_IDENTITY_SALT is using the default placeholder. "
+        "Set a long random SERVER_IDENTITY_SALT env var before exposing this server."
+    )
 REGISTRATION_KEY = os.getenv("REGISTRATION_KEY") if os.getenv("REGISTRATION_KEY") != "" else None
 
 IS_PUBLIC_HUB = _read_bool("IS_PUBLIC_HUB", "True")
