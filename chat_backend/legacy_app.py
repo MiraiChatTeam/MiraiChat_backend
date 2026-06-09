@@ -1888,7 +1888,19 @@ async def register(request: Request, user: UserReg):
     cursor = conn.cursor()
     hashed_pw = bcrypt.hashpw(user.password.encode(), bcrypt.gensalt()).decode()
     identity = get_secure_identity(user.username_hash)
-    final_user_id = user.user_id if user.user_id else str(uuid.uuid4())
+    # The server is the source of truth for user_id and returns it to the client.
+    # A client-supplied user_id is only honored if it is a canonical UUID — the
+    # exact format the server itself issues. This blocks injection of arbitrary
+    # ids (e.g. SQL LIKE wildcards '%'/'_' that later widen offline-message
+    # cleanup in deregister/account_reset) and id-spoofing/collision attempts.
+    requested_user_id = (user.user_id or "").strip()
+    if requested_user_id:
+        try:
+            final_user_id = str(uuid.UUID(requested_user_id))
+        except (ValueError, AttributeError, TypeError):
+            return {"status": "error", "msg": "Invalid user_id"}
+    else:
+        final_user_id = str(uuid.uuid4())
     try:
         cursor.execute(
             "INSERT INTO users (user_id, username_hash, password, public_key, storage_limit) VALUES (?, ?, ?, ?, ?)",
