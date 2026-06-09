@@ -93,7 +93,7 @@ class TrustedProxyIpResolutionTests(unittest.TestCase):
         self.assertNotEqual(ip, self.SPOOF)
 
     def test_no_mode_ever_returns_the_spoofed_value(self):
-        for mode in ("direct", "cloudflare", "xforwarded"):
+        for mode in ("auto", "direct", "cloudflare", "xforwarded"):
             with mock.patch.object(auth_module, "TRUSTED_PROXY_MODE", mode):
                 ip = auth_module.get_real_ip(self._attacker_request())
             self.assertNotEqual(ip, self.SPOOF, f"mode={mode} returned spoofed IP")
@@ -103,6 +103,49 @@ class TrustedProxyIpResolutionTests(unittest.TestCase):
         with mock.patch.object(auth_module, "TRUSTED_PROXY_MODE", "direct"):
             ip = auth_module.get_real_ip(req)
         self.assertEqual(ip, "unknown")
+
+    # --- auto mode: the zero-config safe default ---
+    CF_PEER = "173.245.48.1"      # inside Cloudflare's 173.245.48.0/20 range
+    NON_CF_PEER = "198.51.100.7"  # not a Cloudflare address
+
+    def test_auto_trusts_cf_header_when_peer_is_cloudflare(self):
+        req = _FakeRequest(
+            headers={"CF-Connecting-IP": self.REAL, "X-Real-IP": self.SPOOF},
+            peer=self.CF_PEER,
+        )
+        with mock.patch.object(auth_module, "TRUSTED_PROXY_MODE", "auto"):
+            ip = auth_module.get_real_ip(req)
+        self.assertEqual(ip, self.REAL)
+
+    def test_auto_ignores_forged_cf_header_from_non_cloudflare_peer(self):
+        # A direct attacker (non-CF peer) forging CF-Connecting-IP must NOT be
+        # trusted — this is what makes "auto" safe for direct deployments.
+        req = _FakeRequest(
+            headers={"CF-Connecting-IP": self.SPOOF, "X-Real-IP": self.SPOOF},
+            peer=self.NON_CF_PEER,
+        )
+        with mock.patch.object(auth_module, "TRUSTED_PROXY_MODE", "auto"):
+            ip = auth_module.get_real_ip(req)
+        self.assertEqual(ip, self.NON_CF_PEER)
+        self.assertNotEqual(ip, self.SPOOF)
+
+    def test_auto_falls_back_to_peer_when_cf_peer_but_no_header(self):
+        req = _FakeRequest(headers={}, peer=self.CF_PEER)
+        with mock.patch.object(auth_module, "TRUSTED_PROXY_MODE", "auto"):
+            ip = auth_module.get_real_ip(req)
+        self.assertEqual(ip, self.CF_PEER)
+
+    def test_default_mode_is_auto(self):
+        # Forgetting to set the env var must still be safe (not the legacy
+        # spoofable behavior).
+        self.assertEqual(auth_module.TRUSTED_PROXY_MODE, "auto")
+
+    def test_cloudflare_network_membership(self):
+        self.assertTrue(auth_module._is_cloudflare_peer("173.245.48.1"))
+        self.assertTrue(auth_module._is_cloudflare_peer("104.16.0.5"))
+        self.assertFalse(auth_module._is_cloudflare_peer("198.51.100.7"))
+        self.assertFalse(auth_module._is_cloudflare_peer("unknown"))
+        self.assertFalse(auth_module._is_cloudflare_peer(""))
 
 
 if __name__ == "__main__":

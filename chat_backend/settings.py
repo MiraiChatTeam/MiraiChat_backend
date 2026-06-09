@@ -159,12 +159,15 @@ WELCOME_MESSAGES_FILE = os.getenv("WELCOME_MESSAGES_FILE", "tools/.welcome_messa
 
 # Client-IP resolution policy for rate limiting and the admin IP allowlist.
 #
-#   direct      - (default, safe) ignore all client-supplied forwarding headers
-#                 and use the socket peer address. Correct when the app is
-#                 exposed directly to clients.
-#   cloudflare  - trust ONLY the CF-Connecting-IP header (Cloudflare overwrites
-#                 it on every request; clients cannot forge it). Use when the
-#                 origin is reachable exclusively through Cloudflare.
+#   auto        - (default) trust CF-Connecting-IP ONLY when the socket peer is a
+#                 known Cloudflare edge address; otherwise fall back to the peer.
+#                 Safe out of the box for both Cloudflare-fronted deployments
+#                 (zero config needed) and direct deployments (a forged
+#                 CF-Connecting-IP from a non-CF peer is ignored).
+#   direct      - ignore all client-supplied forwarding headers; use the socket
+#                 peer address. Use when the app is exposed directly to clients.
+#   cloudflare  - always trust CF-Connecting-IP. Use only when the origin is
+#                 reachable EXCLUSIVELY through Cloudflare (peer is always CF).
 #   xforwarded  - trust the LAST hop of X-Forwarded-For (the address appended by
 #                 your own trusted reverse proxy). Only safe behind a proxy that
 #                 strips/overwrites inbound XFF.
@@ -172,9 +175,28 @@ WELCOME_MESSAGES_FILE = os.getenv("WELCOME_MESSAGES_FILE", "tools/.welcome_messa
 # The legacy behavior (trusting X-Real-IP / the FIRST X-Forwarded-For entry) is
 # intentionally not offered: both are fully client-controlled and allowed
 # trivial rate-limit and admin-IP-allowlist bypass.
-TRUSTED_PROXY_MODE = os.getenv("TRUSTED_PROXY_MODE", "direct").strip().lower()
-if TRUSTED_PROXY_MODE not in ("direct", "cloudflare", "xforwarded"):
-    TRUSTED_PROXY_MODE = "direct"
+TRUSTED_PROXY_MODE = os.getenv("TRUSTED_PROXY_MODE", "auto").strip().lower()
+if TRUSTED_PROXY_MODE not in ("auto", "direct", "cloudflare", "xforwarded"):
+    TRUSTED_PROXY_MODE = "auto"
+
+# Cloudflare published edge IP ranges (https://www.cloudflare.com/ips/), used by
+# the "auto" mode to decide whether CF-Connecting-IP can be trusted. Override
+# with CLOUDFLARE_IP_RANGES (comma-separated CIDRs) if Cloudflare changes them.
+_DEFAULT_CLOUDFLARE_IP_RANGES = (
+    # IPv4
+    "173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,"
+    "141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,"
+    "197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,"
+    "104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,"
+    # IPv6
+    "2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,"
+    "2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32"
+)
+CLOUDFLARE_IP_RANGES = [
+    cidr.strip()
+    for cidr in os.getenv("CLOUDFLARE_IP_RANGES", _DEFAULT_CLOUDFLARE_IP_RANGES).split(",")
+    if cidr.strip()
+]
 
 
 def ensure_upload_dir() -> None:

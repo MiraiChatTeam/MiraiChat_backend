@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import ipaddress
 import os
 import time
 from datetime import datetime, timedelta
@@ -18,6 +19,7 @@ from chat_backend.settings import (
     ADMIN_IP_ALLOWLIST,
     ADMIN_PASS_HASH,
     ADMIN_TOTP_SECRET,
+    CLOUDFLARE_IP_RANGES,
     REGISTER_RATE_LIMIT_MAX,
     REGISTER_RATE_LIMIT_WINDOW,
     SESSION_CACHE_TTL,
@@ -109,6 +111,31 @@ def _peer_ip(request: Request) -> str:
     return "unknown"
 
 
+def _build_cloudflare_networks() -> list:
+    nets = []
+    for cidr in CLOUDFLARE_IP_RANGES:
+        try:
+            nets.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
+_CLOUDFLARE_NETWORKS = _build_cloudflare_networks()
+
+
+def _is_cloudflare_peer(peer_ip: str) -> bool:
+    """True when the socket peer address falls within a published Cloudflare
+    edge range — i.e. the request really did arrive via Cloudflare."""
+    if not peer_ip or peer_ip == "unknown":
+        return False
+    try:
+        addr = ipaddress.ip_address(peer_ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _CLOUDFLARE_NETWORKS)
+
+
 def get_real_ip(request: Request) -> str:
     """Resolve the client IP used for rate limiting and the admin IP allowlist.
 
@@ -117,6 +144,18 @@ def get_real_ip(request: Request) -> str:
     are otherwise trivially spoofable and would let an attacker rotate IPs to
     bypass rate limits or forge an allowlisted admin IP.
     """
+    if TRUSTED_PROXY_MODE == "auto":
+        # Zero-config safe default: trust CF-Connecting-IP only when the request
+        # actually came from a Cloudflare edge (verified by socket peer). A
+        # forged CF-Connecting-IP from a non-Cloudflare peer is ignored, so this
+        # is safe for both CF-fronted and direct deployments without any env var.
+        peer = _peer_ip(request)
+        if _is_cloudflare_peer(peer):
+            cf_ip = request.headers.get("CF-Connecting-IP")
+            if cf_ip and cf_ip.strip():
+                return cf_ip.strip()
+        return peer
+
     if TRUSTED_PROXY_MODE == "cloudflare":
         # Cloudflare overwrites CF-Connecting-IP on every request; a client
         # cannot forge it as long as the origin is reachable only via Cloudflare.
@@ -135,7 +174,7 @@ def get_real_ip(request: Request) -> str:
                 return parts[-1]
         return _peer_ip(request)
 
-    # direct (default): never trust client-supplied forwarding headers.
+    # direct: never trust client-supplied forwarding headers.
     return _peer_ip(request)
 
 
