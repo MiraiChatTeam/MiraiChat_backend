@@ -1042,6 +1042,29 @@ def _check_scheduled_rotation() -> None:
 def get_secure_identity(client_hash: str) -> str:
     return hmac.new(SERVER_IDENTITY_SALT.encode(), client_hash.encode(), hashlib.sha256).hexdigest()
 
+
+def _resolve_registration_user_id(requested: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Resolve the user_id to persist at registration.
+
+    The server is the source of truth for user_id and returns it to the client.
+    A client-supplied value is honored ONLY if it is a canonical UUID — the
+    exact format the server itself issues — which blocks injection of arbitrary
+    ids (e.g. SQL LIKE wildcards '%'/'_' that later widen offline-message
+    cleanup in deregister/account_reset) and id-spoofing/collision attempts.
+
+    Returns (user_id, None) on success, or (None, error_message) when an invalid
+    non-UUID value was supplied. When nothing is supplied, a fresh server UUID
+    is generated.
+    """
+    requested_user_id = (requested or "").strip()
+    if not requested_user_id:
+        return str(uuid.uuid4()), None
+    try:
+        return str(uuid.UUID(requested_user_id)), None
+    except (ValueError, AttributeError, TypeError):
+        return None, "Invalid user_id"
+
+
 def _receipt_hash(platform: str, verification_source: str, verification_data: str) -> str:
     base = f"{platform}|{verification_source}|{verification_data}".encode("utf-8")
     return hashlib.sha256(base).hexdigest()
@@ -1888,19 +1911,9 @@ async def register(request: Request, user: UserReg):
     cursor = conn.cursor()
     hashed_pw = bcrypt.hashpw(user.password.encode(), bcrypt.gensalt()).decode()
     identity = get_secure_identity(user.username_hash)
-    # The server is the source of truth for user_id and returns it to the client.
-    # A client-supplied user_id is only honored if it is a canonical UUID — the
-    # exact format the server itself issues. This blocks injection of arbitrary
-    # ids (e.g. SQL LIKE wildcards '%'/'_' that later widen offline-message
-    # cleanup in deregister/account_reset) and id-spoofing/collision attempts.
-    requested_user_id = (user.user_id or "").strip()
-    if requested_user_id:
-        try:
-            final_user_id = str(uuid.UUID(requested_user_id))
-        except (ValueError, AttributeError, TypeError):
-            return {"status": "error", "msg": "Invalid user_id"}
-    else:
-        final_user_id = str(uuid.uuid4())
+    final_user_id, user_id_error = _resolve_registration_user_id(user.user_id)
+    if user_id_error:
+        return {"status": "error", "msg": user_id_error}
     try:
         cursor.execute(
             "INSERT INTO users (user_id, username_hash, password, public_key, storage_limit) VALUES (?, ?, ?, ?, ?)",
