@@ -1,8 +1,9 @@
 """Tests for registration user_id validation (_resolve_registration_user_id).
 
-A client-supplied user_id is honored only when it is a canonical UUID; anything
-else (SQL LIKE wildcards, JSON-injection fragments, arbitrary strings) is
-rejected, and an absent value yields a fresh server UUID.
+Clients may pick their own identifier (e.g. a preferred username) as long as it
+uses only safe characters [A-Za-z0-9._-] within a length bound. Injection
+characters — SQL LIKE wildcards, quotes, backslashes, whitespace — are rejected,
+and an absent value yields a fresh server UUID.
 
 Importing chat_backend.legacy_app pulls the full backend runtime (fastapi,
 cryptography, ...) and initializes a database, so the test points CHAT_DB_PATH
@@ -39,40 +40,56 @@ class ResolveRegistrationUserIdTests(unittest.TestCase):
             # Must be a valid canonical UUID string.
             self.assertEqual(str(uuid.UUID(user_id)), user_id)
 
-    def test_canonical_uuid_is_accepted_verbatim(self):
-        canonical = "550e8400-e29b-41d4-a716-446655440000"
-        user_id, err = legacy_app._resolve_registration_user_id(canonical)
-        self.assertIsNone(err)
-        self.assertEqual(user_id, canonical)
+    def test_custom_usernames_are_allowed(self):
+        # The whole point: users may choose their own identifier.
+        for name in ("shen_yi", "Alice.99", "cool-user", "user_2026", "a", "A1b2C3", "x" * 64):
+            user_id, err = legacy_app._resolve_registration_user_id(name)
+            self.assertIsNone(err, f"{name!r} should be accepted")
+            self.assertEqual(user_id, name)
 
-    def test_uuid_is_normalized(self):
-        # Uppercase / surrounding whitespace is accepted and normalized.
-        user_id, err = legacy_app._resolve_registration_user_id(
-            "  550E8400-E29B-41D4-A716-446655440000  "
-        )
+    def test_surrounding_whitespace_is_trimmed(self):
+        user_id, err = legacy_app._resolve_registration_user_id("  shen_yi  ")
         self.assertIsNone(err)
-        self.assertEqual(user_id, "550e8400-e29b-41d4-a716-446655440000")
+        self.assertEqual(user_id, "shen_yi")
 
     def test_like_wildcards_are_rejected(self):
-        for malicious in ("%", "_", "%admin%"):
+        # '%' is rejected outright. ('_' is a normal username character and is
+        # allowed; the cleanup queries escape LIKE metacharacters — see the
+        # hardening PR's _escape_like — so '_' cannot widen a match.)
+        for malicious in ("%", "%admin%", "user%", "50%off"):
             user_id, err = legacy_app._resolve_registration_user_id(malicious)
             self.assertIsNone(user_id, f"{malicious!r} should be rejected")
             self.assertEqual(err, "Invalid user_id")
 
-    def test_injection_fragments_are_rejected(self):
-        for malicious in ('","to_id":"', "../../etc/passwd", "admin", "' OR '1'='1"):
+    def test_quote_backslash_and_injection_fragments_are_rejected(self):
+        for malicious in (
+            '","to_id":"',
+            "../../etc/passwd",
+            "' OR '1'='1",
+            "back\\slash",
+            'quote"inside',
+            "has space",
+            "emoji😀",
+        ):
             user_id, err = legacy_app._resolve_registration_user_id(malicious)
             self.assertIsNone(user_id, f"{malicious!r} should be rejected")
             self.assertEqual(err, "Invalid user_id")
 
-    def test_rejected_ids_never_contain_sql_wildcards(self):
+    def test_overlong_value_is_rejected(self):
+        user_id, err = legacy_app._resolve_registration_user_id("a" * 65)
+        self.assertIsNone(user_id)
+        self.assertEqual(err, "Invalid user_id")
+
+    def test_accepted_ids_never_contain_dangerous_metachars(self):
         # Defense-in-depth contract: a returned (non-None) user_id can never
-        # carry a LIKE wildcard into the offline-message cleanup queries.
-        for value in ("%", "_", "x_y", "a%b", "550e8400-e29b-41d4-a716-446655440000", ""):
+        # carry a quote / backslash / % wildcard / whitespace into the cleanup
+        # queries. ('_' is permitted; LIKE escaping handles it at the call site.)
+        samples = ("%", "x_y", "a%b", 'q"q', "back\\x", "shen_yi", "Alice.99", "", "ok-name")
+        for value in samples:
             user_id, _ = legacy_app._resolve_registration_user_id(value)
             if user_id is not None:
-                self.assertNotIn("%", user_id)
-                self.assertNotIn("_", user_id)
+                for bad in ("%", '"', "\\", "'", " "):
+                    self.assertNotIn(bad, user_id, f"{value!r} -> {user_id!r} leaked {bad!r}")
 
 
 if __name__ == "__main__":
