@@ -22,6 +22,7 @@ from chat_backend.settings import (
     REGISTER_RATE_LIMIT_WINDOW,
     SESSION_CACHE_TTL,
     SESSION_EXPIRY_DAYS,
+    TRUSTED_PROXY_MODE,
 )
 
 
@@ -101,16 +102,41 @@ def _ensure_session_last_seen_column() -> None:
         conn.close()
 
 
+def _peer_ip(request: Request) -> str:
+    client = request.client
+    if client and client.host:
+        return client.host
+    return "unknown"
+
+
 def get_real_ip(request: Request) -> str:
-    ip = request.headers.get("X-Real-IP")
-    if ip:
-        return ip
+    """Resolve the client IP used for rate limiting and the admin IP allowlist.
 
-    xff = request.headers.get("X-Forwarded-For")
-    if xff:
-        return xff.split(",")[0].strip()
+    Controlled by TRUSTED_PROXY_MODE. Client-supplied forwarding headers are
+    honored ONLY in the mode that matches the actual deployment, because they
+    are otherwise trivially spoofable and would let an attacker rotate IPs to
+    bypass rate limits or forge an allowlisted admin IP.
+    """
+    if TRUSTED_PROXY_MODE == "cloudflare":
+        # Cloudflare overwrites CF-Connecting-IP on every request; a client
+        # cannot forge it as long as the origin is reachable only via Cloudflare.
+        cf_ip = request.headers.get("CF-Connecting-IP")
+        if cf_ip and cf_ip.strip():
+            return cf_ip.strip()
+        return _peer_ip(request)
 
-    return request.client.host
+    if TRUSTED_PROXY_MODE == "xforwarded":
+        # Trust the LAST hop appended by our own reverse proxy, not the first
+        # (client-controlled) entry.
+        xff = request.headers.get("X-Forwarded-For")
+        if xff:
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            if parts:
+                return parts[-1]
+        return _peer_ip(request)
+
+    # direct (default): never trust client-supplied forwarding headers.
+    return _peer_ip(request)
 
 
 def _get_request_ip(request: Request) -> str:

@@ -157,6 +157,25 @@ REGISTER_RATE_LIMIT_MAX = int(os.getenv("REGISTER_RATE_LIMIT_MAX", "10"))
 REGISTER_RATE_LIMIT_WINDOW = int(os.getenv("REGISTER_RATE_LIMIT_WINDOW", "3600"))
 WELCOME_MESSAGES_FILE = os.getenv("WELCOME_MESSAGES_FILE", "tools/.welcome_messages.json")
 
+# Client-IP resolution policy for rate limiting and the admin IP allowlist.
+#
+#   direct      - (default, safe) ignore all client-supplied forwarding headers
+#                 and use the socket peer address. Correct when the app is
+#                 exposed directly to clients.
+#   cloudflare  - trust ONLY the CF-Connecting-IP header (Cloudflare overwrites
+#                 it on every request; clients cannot forge it). Use when the
+#                 origin is reachable exclusively through Cloudflare.
+#   xforwarded  - trust the LAST hop of X-Forwarded-For (the address appended by
+#                 your own trusted reverse proxy). Only safe behind a proxy that
+#                 strips/overwrites inbound XFF.
+#
+# The legacy behavior (trusting X-Real-IP / the FIRST X-Forwarded-For entry) is
+# intentionally not offered: both are fully client-controlled and allowed
+# trivial rate-limit and admin-IP-allowlist bypass.
+TRUSTED_PROXY_MODE = os.getenv("TRUSTED_PROXY_MODE", "direct").strip().lower()
+if TRUSTED_PROXY_MODE not in ("direct", "cloudflare", "xforwarded"):
+    TRUSTED_PROXY_MODE = "direct"
+
 
 def ensure_upload_dir() -> None:
     os.makedirs(UPLOAD_DIR, exist_ok=True)
