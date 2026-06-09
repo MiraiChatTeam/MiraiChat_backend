@@ -124,6 +124,10 @@ if os.path.exists(SIGNING_KEY_FILE):
                 format=serialization.PrivateFormat.PKCS8,
                 encryption_algorithm=serialization.NoEncryption()
             ))
+        try:
+            os.chmod(SIGNING_KEY_FILE, 0o600)
+        except OSError:
+            pass
 else:
     _private_key = ed25519.Ed25519PrivateKey.generate()
     with open(SIGNING_KEY_FILE, "wb") as f:
@@ -132,6 +136,10 @@ else:
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption()
         ))
+    try:
+        os.chmod(SIGNING_KEY_FILE, 0o600)
+    except OSError:
+        pass
 
 _server_public_key = _private_key.public_key()
 
@@ -943,6 +951,12 @@ def _perform_identity_key_rotation() -> dict:
                 format=serialization.PrivateFormat.PKCS8,
                 encryption_algorithm=serialization.NoEncryption(),
             ))
+        # Restrict to owner read/write — private signing key must not be
+        # group/other readable.
+        try:
+            os.chmod(OLD_SIGNING_KEY_FILE, 0o600)
+        except OSError:
+            pass
 
         # Atomic write of new key (write temp then rename)
         tmp_path = SIGNING_KEY_FILE + ".tmp"
@@ -952,6 +966,10 @@ def _perform_identity_key_rotation() -> dict:
                 format=serialization.PrivateFormat.PKCS8,
                 encryption_algorithm=serialization.NoEncryption(),
             ))
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
         os.replace(tmp_path, SIGNING_KEY_FILE)
 
         cursor.execute(
@@ -1041,6 +1059,22 @@ def _check_scheduled_rotation() -> None:
 # --- Security Helpers ---
 def get_secure_identity(client_hash: str) -> str:
     return hmac.new(SERVER_IDENTITY_SALT.encode(), client_hash.encode(), hashlib.sha256).hexdigest()
+
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards so a client-controlled value cannot widen the match.
+
+    Use together with an explicit ESCAPE '\\' clause. user_id is client-supplied
+    at registration, so an unescaped '%' / '_' embedded in a LIKE pattern would
+    otherwise match other users' rows.
+    """
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
 
 def _receipt_hash(platform: str, verification_source: str, verification_data: str) -> str:
     base = f"{platform}|{verification_source}|{verification_data}".encode("utf-8")
@@ -2015,6 +2049,10 @@ async def login(request: Request, user: UserLogin):
 @app.post("/chat/link_submit")
 async def link_submit(request: Request, req: LinkSubmit, session_secret: str = Header(default=None, alias="session-secret")):
     check_rate_limit(request, 10)
+    # Guard: reject empty/blank tokens before any DB lookup so they can never
+    # match a soft-deleted session row (logout blanks session_secret to '').
+    if not session_secret or not session_secret.strip():
+        raise HTTPException(status_code=401)
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT is_main FROM sessions WHERE session_secret=?", (session_secret,))
@@ -2059,6 +2097,10 @@ async def link_fetch(link_id: str):
 
 @app.get("/chat/sender_certificate")
 async def get_sender_certificate(session_secret: str = Header(default=None, alias="session-secret")):
+    # Guard: reject empty/blank tokens before any DB lookup so they can never
+    # match a soft-deleted session row (logout blanks session_secret to '').
+    if not session_secret or not session_secret.strip():
+        raise HTTPException(status_code=401)
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM sessions WHERE session_secret=?", (session_secret,))
@@ -2079,6 +2121,10 @@ async def get_sender_certificate(session_secret: str = Header(default=None, alia
 
 @app.get("/chat/list_devices")
 async def list_devices(session_secret: str = Header(default=None, alias="session-secret")):
+    # Guard: reject empty/blank tokens before any DB lookup so they can never
+    # match a soft-deleted session row (logout blanks session_secret to '').
+    if not session_secret or not session_secret.strip():
+        raise HTTPException(status_code=401)
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM sessions WHERE session_secret=?", (session_secret,))
@@ -2092,6 +2138,10 @@ async def list_devices(session_secret: str = Header(default=None, alias="session
 
 @app.post("/chat/promote_main_device")
 async def promote_main_device(session_secret: str = Header(default=None, alias="session-secret")):
+    # Guard: reject empty/blank tokens before any DB lookup so they can never
+    # match a soft-deleted session row (logout blanks session_secret to '').
+    if not session_secret or not session_secret.strip():
+        raise HTTPException(status_code=401)
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -2185,6 +2235,10 @@ async def promote_main_device(session_secret: str = Header(default=None, alias="
 
 @app.post("/chat/kill_device")
 async def kill_device(target_device_id: str, session_secret: str = Header(default=None, alias="session-secret")):
+    # Guard: reject empty/blank tokens before any DB lookup so they can never
+    # match a soft-deleted session row (logout blanks session_secret to '').
+    if not session_secret or not session_secret.strip():
+        raise HTTPException(status_code=401)
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, is_main FROM sessions WHERE session_secret=?", (session_secret,))
@@ -2449,6 +2503,10 @@ async def upload_file(
 ):
     conn = get_db()
     cursor = conn.cursor()
+    # Guard: reject empty/blank tokens before any DB lookup so they can never
+    # match a soft-deleted session row (logout blanks session_secret to '').
+    if not token or not token.strip():
+        conn.close(); raise HTTPException(status_code=401)
     cursor.execute("SELECT u.user_id, u.storage_used FROM users u JOIN sessions s ON u.user_id = s.user_id WHERE s.session_secret=?", (token,))
     user = cursor.fetchone()
     if not user:
@@ -3569,6 +3627,12 @@ def deregister(user: UserLogin):
     for session_key, _ in list(connection_registry.get_user_sessions(uid).items()):
         connection_registry.remove(uid, session_key)
 
+    # Collect this user's session secrets so we can evict the in-process session
+    # cache after deletion. Otherwise validate_session_token() would keep
+    # returning the deleted user from cache for up to SESSION_CACHE_TTL seconds.
+    cursor.execute("SELECT session_secret FROM sessions WHERE user_id=?", (uid,))
+    _doomed_secrets = [r["session_secret"] for r in cursor.fetchall() if r["session_secret"]]
+
     # Cleanup queued/offline payloads that reference this user as sender and/or target.
     cursor.execute(
         "SELECT id FROM offline_messages WHERE receiver_id=?",
@@ -3577,8 +3641,8 @@ def deregister(user: UserLogin):
     owned_offline_ids = [int(r["id"]) for r in cursor.fetchall() if r["id"] is not None]
 
     cursor.execute(
-        "SELECT id FROM offline_messages WHERE payload LIKE ? OR payload LIKE ?",
-        (f'%"from_id":"{uid}"%', f'%"to_id":"{uid}"%'),
+        "SELECT id FROM offline_messages WHERE payload LIKE ? ESCAPE '\\' OR payload LIKE ? ESCAPE '\\'",
+        (f'%"from_id":"{_escape_like(uid)}"%', f'%"to_id":"{_escape_like(uid)}"%'),
     )
     referenced_offline_ids = [int(r["id"]) for r in cursor.fetchall() if r["id"] is not None]
 
@@ -3609,6 +3673,11 @@ def deregister(user: UserLogin):
     cursor.execute("DELETE FROM file_registry WHERE owner_id=?", (uid,))
     
     conn.commit(); conn.close()
+
+    # Evict cached session tokens so the just-deleted account cannot keep
+    # authenticating from the in-process cache during its TTL window.
+    for _secret in _doomed_secrets:
+        session_cache_invalidate(_secret)
     return {"status": "ok"}
 
 
@@ -3621,8 +3690,8 @@ def _collect_user_offline_message_ids(cursor: sqlite3.Cursor, user_id: str) -> l
     owned_ids = [int(r["id"]) for r in cursor.fetchall() if r["id"] is not None]
 
     cursor.execute(
-        "SELECT id FROM offline_messages WHERE payload LIKE ? OR payload LIKE ?",
-        (f'%\"from_id\":\"{user_id}\"%', f'%\"to_id\":\"{user_id}\"%'),
+        "SELECT id FROM offline_messages WHERE payload LIKE ? ESCAPE '\\' OR payload LIKE ? ESCAPE '\\'",
+        (f'%\"from_id\":\"{_escape_like(user_id)}\"%', f'%\"to_id\":\"{_escape_like(user_id)}\"%'),
     )
     referenced_ids = [
         int(r["id"]) for r in cursor.fetchall() if r["id"] is not None

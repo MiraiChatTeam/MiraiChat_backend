@@ -378,6 +378,15 @@ def verify_ephemeral_token(from_id: str, nonce: str, timestamp_str: str, token: 
         for old_nonce in old_nonces:
             del NONCE_CACHE[old_nonce]
 
+        # Hard size cap: time-based eviction alone lets the cache grow unbounded
+        # under a high-throughput sender within the 600s window. Evict the
+        # oldest entries when over MAX_NONCE_CACHE_SIZE.
+        if len(NONCE_CACHE) > MAX_NONCE_CACHE_SIZE:
+            for stale_nonce, _ in sorted(NONCE_CACHE.items(), key=lambda kv: kv[1])[
+                : len(NONCE_CACHE) - MAX_NONCE_CACHE_SIZE
+            ]:
+                NONCE_CACHE.pop(stale_nonce, None)
+
         return True
     except Exception:
         return False
