@@ -151,6 +151,8 @@ SESSION_EXPIRY_DAYS = int(os.getenv("SESSION_EXPIRY_DAYS", "30"))
 SESSION_CACHE_TTL = int(os.getenv("SESSION_CACHE_TTL", "30"))
 
 SIGNING_KEY_FILE = os.getenv("SIGNING_KEY_FILE", "server_signing_key.pem")
+IDENTITY_KEY_FILE = os.getenv("IDENTITY_KEY_FILE", SIGNING_KEY_FILE)
+IDENTITY_PUBLIC_KEY_FILE = os.getenv("IDENTITY_PUBLIC_KEY_FILE", "server_identity_public_key.txt")
 OLD_SIGNING_KEY_FILE = os.getenv("OLD_SIGNING_KEY_FILE", "server_signing_key_old.pem")
 
 REGISTER_RATE_LIMIT_MAX = int(os.getenv("REGISTER_RATE_LIMIT_MAX", "10"))

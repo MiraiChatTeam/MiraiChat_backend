@@ -67,6 +67,8 @@ from chat_backend.settings import (
     GOOGLE_PLAY_PACKAGE_NAME,
     GOOGLE_PLAY_SERVICE_ACCOUNT_JSON,
     IS_PUBLIC_HUB,
+    IDENTITY_KEY_FILE,
+    IDENTITY_PUBLIC_KEY_FILE,
     OFFLINE_MSG_RETENTION_DAYS,
     OLD_SIGNING_KEY_FILE,
     PAYMENT_MODE,
@@ -109,31 +111,135 @@ linking_blobs = {}
 # Freshly registered accounts may bootstrap a first main-device session once.
 _fresh_registration_main_bootstrap: dict[str, float] = {}
 
-# --- Master Signing Key for Sealed Sender ---
-# Path may be provided via env; default kept for compatibility
-SIGNING_KEY_FILE = os.getenv("SIGNING_KEY_FILE", "server_signing_key.pem")
-if os.path.exists(SIGNING_KEY_FILE):
-    try:
-        with open(SIGNING_KEY_FILE, "rb") as f:
-            _private_key = serialization.load_pem_private_key(f.read(), password=None)
-    except Exception:
-        _private_key = ed25519.Ed25519PrivateKey.generate()
-        with open(SIGNING_KEY_FILE, "wb") as f:
-            f.write(_private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption()
-            ))
-else:
-    _private_key = ed25519.Ed25519PrivateKey.generate()
-    with open(SIGNING_KEY_FILE, "wb") as f:
-        f.write(_private_key.private_bytes(
+# --- Welded Ed25519 Server Identity Key ---
+# SIGNING_KEY_FILE remains as a compatibility alias for existing deployments.
+def _identity_public_key_b64(public_key) -> str:
+    raw = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return base64.b64encode(raw).decode()
+
+
+def _identity_fingerprint_for_public_key(public_key) -> str:
+    raw = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    digest = hashlib.sha256(raw).digest()
+    return ":".join(f"{b:02X}" for b in digest)
+
+
+def _write_private_identity_key(path: str, private_key) -> None:
+    with open(path, "wb") as f:
+        f.write(private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption()
+            encryption_algorithm=serialization.NoEncryption(),
         ))
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
+
+def _write_public_identity_metadata() -> None:
+    public_key = _private_key.public_key()
+    payload = {
+        "identity_public_key": _identity_public_key_b64(public_key),
+        "identity_fingerprint": _identity_fingerprint_for_public_key(public_key),
+        "identity_key_version": 1,
+    }
+    with open(IDENTITY_PUBLIC_KEY_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True)
+        f.write("\n")
+
+
+def _load_or_create_identity_key():
+    for path in (IDENTITY_KEY_FILE, SIGNING_KEY_FILE):
+        if path and os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    key = serialization.load_pem_private_key(f.read(), password=None)
+                if not isinstance(key, ed25519.Ed25519PrivateKey):
+                    raise TypeError("identity key must be Ed25519")
+                if path != IDENTITY_KEY_FILE:
+                    _write_private_identity_key(IDENTITY_KEY_FILE, key)
+                return key
+            except Exception as exc:
+                print(f"⚠️  Failed to load identity key from {path}: {exc}")
+
+    key = ed25519.Ed25519PrivateKey.generate()
+    _write_private_identity_key(IDENTITY_KEY_FILE, key)
+    return key
+
+
+_private_key = _load_or_create_identity_key()
+if SIGNING_KEY_FILE != IDENTITY_KEY_FILE and not os.path.exists(SIGNING_KEY_FILE):
+    _write_private_identity_key(SIGNING_KEY_FILE, _private_key)
 _server_public_key = _private_key.public_key()
+_write_public_identity_metadata()
+
+
+def _server_identity_envelope(payload: dict) -> dict:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    signature = _private_key.sign(canonical.encode())
+    return {
+        "payload": payload,
+        "signature": base64.b64encode(signature).decode(),
+        "identity_public_key": _identity_public_key_b64(_server_public_key),
+        "identity_fingerprint": _identity_fingerprint_for_public_key(_server_public_key),
+    }
+
+
+def _signed_transport_descriptor(descriptor: dict) -> dict:
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=10)
+    sequence = int(now.timestamp() * 1000)
+    payload = {
+        "version": 1,
+        "key_id": _identity_fingerprint_for_public_key(_server_public_key),
+        "api_base_url": descriptor.get("api_base_url", ""),
+        "ws_connection_mode": descriptor.get("ws_connection_mode", ""),
+        "ws_public_url": descriptor.get("ws_public_url", ""),
+        "region_policy_mode": descriptor.get("region_policy_mode", ""),
+        "default_region": descriptor.get("default_region", ""),
+        "china_fcm_policy": descriptor.get("china_fcm_policy", ""),
+        "issued_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "nonce": secrets.token_urlsafe(16),
+        # TODO: replace timestamp-derived sequence with a persisted monotonic source.
+        "sequence": sequence,
+    }
+    return _server_identity_envelope(payload)
+
+
+def _signed_ws_ticket_payload(
+    *,
+    ticket: str,
+    ticket_hash: str,
+    expires_at: datetime,
+    descriptor: dict,
+    descriptor_hash: Optional[str],
+) -> dict:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "version": 1,
+        "key_id": _identity_fingerprint_for_public_key(_server_public_key),
+        "ticket": ticket,
+        "ticket_hash": ticket_hash,
+        "audience": "websocket",
+        "ws_public_url": descriptor.get("ws_public_url", ""),
+        # TODO: require clients to send the signed descriptor hash once rollout is complete.
+        "descriptor_hash": descriptor_hash,
+        "issued_at": now.isoformat(),
+        "expires_at": expires_at.astimezone(timezone.utc).isoformat()
+        if expires_at.tzinfo
+        else expires_at.replace(tzinfo=timezone.utc).isoformat(),
+        "nonce": secrets.token_urlsafe(16),
+    }
+    return _server_identity_envelope(payload)
+print(f"🔐 Server identity fingerprint: {_identity_fingerprint_for_public_key(_server_public_key)}")
 
 # Old signing key retained during grace period after rotation
 # _old_private_key is set in-process after _load_grace_period_state(); do not initialise from file here.
@@ -470,11 +576,49 @@ def _queue_offline_with_push(
     return None
 
 
+def _is_npk_protocol_control(msg: dict) -> bool:
+    if not isinstance(msg, dict):
+        return False
+    msg_type = str(msg.get("type") or "").strip().lower()
+    control_type = str(msg.get("control_type") or "").strip().lower()
+    return msg_type == "protocol_control" and control_type in {
+        "npk_announce",
+        "npk_request",
+        "npk_response",
+    }
+
+
+def _enforce_protocol_control_silence(msg: dict, sender_id: str) -> dict:
+    if not _is_npk_protocol_control(msg):
+        return msg
+    normalized = dict(msg)
+    control_type = str(normalized.get("control_type") or "").strip().lower()
+    to_id = str(
+        normalized.get("recipient_user_id")
+        or normalized.get("to_id")
+        or ""
+    ).strip()
+    normalized["type"] = "protocol_control"
+    normalized["control_type"] = control_type
+    normalized["control_v"] = 1
+    normalized["hidden"] = True
+    normalized["no_push"] = True
+    normalized["no_unread"] = True
+    normalized["from_id"] = sender_id
+    normalized["sender_user_id"] = str(normalized.get("sender_user_id") or sender_id)
+    normalized["to_id"] = to_id
+    normalized["recipient_user_id"] = to_id
+    if not str(normalized.get("created_at") or "").strip():
+        normalized["created_at"] = datetime.now(timezone.utc).isoformat()
+    return normalized
+
+
 def _build_delegated_push_metadata(msg: dict) -> dict:
     """Build opaque delegated push metadata without inspecting preview content."""
+    has_v2_envelope = msg.get("preview_envelope_v2") not in (None, "")
     push_data = {
         "type": msg.get("push_type") or msg.get("type"),
-        "enc_v": "2",
+        "enc_v": "2" if has_v2_envelope else "1",
     }
 
     for source_key, output_key in (
@@ -493,6 +637,17 @@ def _build_delegated_push_metadata(msg: dict) -> dict:
         preview_envelope = msg.get("preview_envelope_v1")
         if preview_envelope not in (None, ""):
             push_data["preview_envelope_v1"] = preview_envelope
+    if "preview_envelope_v2" in msg:
+        preview_envelope = msg.get("preview_envelope_v2")
+        if preview_envelope not in (None, ""):
+            push_data["preview_envelope_v2"] = preview_envelope
+    if "encrypted_title" in msg:
+        encrypted_title = msg.get("encrypted_title")
+        if encrypted_title not in (None, ""):
+            push_data["encrypted_title"] = encrypted_title
+    for key in ("preview_envelope_v2_only", "v2_preview_only"):
+        if key in msg and msg.get(key) is not None:
+            push_data[key] = msg.get(key)
 
     return push_data
 
@@ -825,12 +980,7 @@ def _compute_identity_fingerprint(public_key) -> str:
 
     This is the canonical "server identity fingerprint" pinned by clients.
     """
-    raw_bytes = public_key.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    )
-    digest = hashlib.sha256(raw_bytes).digest()
-    return ':'.join(f'{b:02X}' for b in digest)
+    return _identity_fingerprint_for_public_key(public_key)
 
 
 def _load_grace_period_state() -> None:
@@ -885,6 +1035,16 @@ def _load_grace_period_state() -> None:
 _load_grace_period_state()
 
 
+def _persist_rotated_identity_key(new_priv) -> None:
+    tmp_path = IDENTITY_KEY_FILE + ".tmp"
+    _write_private_identity_key(tmp_path, new_priv)
+    os.replace(tmp_path, IDENTITY_KEY_FILE)
+    if SIGNING_KEY_FILE != IDENTITY_KEY_FILE:
+        signing_tmp = SIGNING_KEY_FILE + ".tmp"
+        _write_private_identity_key(signing_tmp, new_priv)
+        os.replace(signing_tmp, SIGNING_KEY_FILE)
+
+
 def _perform_identity_key_rotation() -> dict:
     """Generate a new Ed25519 keypair, create a signed rotation announcement, persist
     both keys, store the announcement in the DB, and update the in-process globals.
@@ -892,9 +1052,6 @@ def _perform_identity_key_rotation() -> dict:
     MUST NOT be called when IS_PUBLIC_HUB is True.  Raises ValueError in that case.
     """
     global _private_key, _server_public_key, _old_private_key, _old_public_key, _grace_period_ends_at
-
-    if IS_PUBLIC_HUB:
-        raise ValueError("Public hub uses a long-term identity key – rotation is not permitted.")
 
     conn = get_db()
     cursor = conn.cursor()
@@ -944,15 +1101,7 @@ def _perform_identity_key_rotation() -> dict:
                 encryption_algorithm=serialization.NoEncryption(),
             ))
 
-        # Atomic write of new key (write temp then rename)
-        tmp_path = SIGNING_KEY_FILE + ".tmp"
-        with open(tmp_path, "wb") as f:
-            f.write(new_priv.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption(),
-            ))
-        os.replace(tmp_path, SIGNING_KEY_FILE)
+        _persist_rotated_identity_key(new_priv)
 
         cursor.execute(
             """
@@ -983,6 +1132,7 @@ def _perform_identity_key_rotation() -> dict:
         _old_private_key = old_priv
         _old_public_key = old_pub
         _grace_period_ends_at = grace_period_ends_at
+        _write_public_identity_metadata()
 
         print(f"✅ Identity key rotated.")
         print(f"   Old fingerprint : {old_fingerprint}")
@@ -995,13 +1145,17 @@ def _perform_identity_key_rotation() -> dict:
             "new_fingerprint": new_fingerprint,
             "valid_from": valid_from,
             "grace_period_ends_at": grace_period_ends_at,
-            "next_rotation_at": next_rotation,
+            "identity_public_key": new_pub_b64,
+            "identity_fingerprint": new_fingerprint,
+            "identity_key_version": 1,
         }
     finally:
         conn.close()
 
 
 def _check_scheduled_rotation() -> None:
+    """Identity keys are welded; automatic rotation is intentionally disabled."""
+    return
     """Trigger a rotation when the scheduled time has arrived.
 
     No-op on public hub or when rotation is disabled in the DB config.
@@ -1756,7 +1910,11 @@ def _resolve_transport_descriptor() -> dict:
 @app.get("/chat/transport_descriptor")
 async def transport_descriptor():
     descriptor = _resolve_transport_descriptor()
-    return {"status": "ok", **descriptor}
+    return {
+        "status": "ok",
+        **descriptor,
+        "signed_transport_descriptor": _signed_transport_descriptor(descriptor),
+    }
 
 
 @app.get("/_new/presence_stats")
@@ -2376,18 +2534,16 @@ async def issue_ws_ticket(request: Request, session_secret: str = Header(default
     if not allowed:
         return _storm_throttled_response(retry_after=retry_after, reason=reason)
 
-    cached = storm_guard.get_cached_ws_ticket(session_secret)
-    if cached is not None:
-        cached_ticket, cached_expires_at = cached
-        return {
-            "status": "ok",
-            "ws_ticket": cached_ticket,
-            "expires_at": cached_expires_at,
-            "transport": _resolve_transport_descriptor(),
-            "deduped": True,
-        }
-
     storm_guard.maybe_heal_user_state(get_db, user_id)
+    descriptor_hash = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            raw_descriptor_hash = body.get("descriptor_hash")
+            if isinstance(raw_descriptor_hash, str) and raw_descriptor_hash.strip():
+                descriptor_hash = raw_descriptor_hash.strip()
+    except Exception:
+        descriptor_hash = None
 
     ticket = secrets.token_urlsafe(32)
     ticket_hash = hashlib.sha256(ticket.encode()).hexdigest()
@@ -2401,19 +2557,20 @@ async def issue_ws_ticket(request: Request, session_secret: str = Header(default
     )
     conn.commit()
     conn.close()
-
-    storm_guard.cache_ws_ticket(
-        session_secret,
-        user_id,
-        ticket,
-        expires_at.timestamp(),
-    )
+    descriptor = _resolve_transport_descriptor()
 
     return {
         "status": "ok",
         "ws_ticket": ticket,
         "expires_at": expires_at.isoformat(),
-        "transport": _resolve_transport_descriptor(),
+        "transport": descriptor,
+        "signed_ws_ticket": _signed_ws_ticket_payload(
+            ticket=ticket,
+            ticket_hash=ticket_hash,
+            expires_at=expires_at,
+            descriptor=descriptor,
+            descriptor_hash=descriptor_hash,
+        ),
     }
 
 @app.get("/chat/lookup")
@@ -2654,6 +2811,29 @@ def _normalize_fingerprint(fingerprint: str) -> Optional[str]:
             return None
     return raw
 
+
+def _identity_metadata_response() -> dict:
+    public_key = _server_public_key
+    return {
+        "identity_public_key": _identity_public_key_b64(public_key),
+        "identity_fingerprint": _compute_identity_fingerprint(public_key),
+        "identity_key_version": 1,
+    }
+
+
+def _verify_identity_rotation_admin(
+    request: Request,
+    credentials: HTTPBasicCredentials,
+    x_admin_totp: Optional[str],
+) -> None:
+    verify_admin_access(request, credentials, x_admin_totp)
+    if not ADMIN_TOTP_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin TOTP must be configured before identity key rotation",
+        )
+
+
 @app.post("/admin/add_rotation_pin")
 def add_rotation_pin(req: RotationPinUpdate, _: bool = Depends(verify_admin_access)):
     domain = _normalize_domain(req.domain)
@@ -2710,9 +2890,18 @@ def get_rotation_announcement():
         "old_fingerprint": ann["old_fingerprint"],
         "new_fingerprint": ann["new_fingerprint"],
         "new_public_key": ann["new_public_key"],
+        "identity_key_version": 1,
         "valid_from": ann["valid_from"],
         "grace_period_ends_at": ann["grace_period_ends_at"],
         "signature": ann["signature"],
+    }
+
+
+@app.get("/admin/identity")
+def get_admin_identity_metadata(_: bool = Depends(verify_admin_access)):
+    return {
+        "status": "ok",
+        **_identity_metadata_response(),
     }
 
 
@@ -2818,8 +3007,25 @@ def set_identity_rotation_config(
     return {"status": "ok"}
 
 
+@app.post("/admin/identity/rotate")
+def rotate_identity_key_admin(
+    request: Request,
+    credentials: HTTPBasicCredentials = Security(security),
+    x_admin_totp: Optional[str] = Header(default=None, alias="x-admin-totp"),
+):
+    _verify_identity_rotation_admin(request, credentials, x_admin_totp)
+    try:
+        return _perform_identity_key_rotation()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Rotation failed: {exc}")
+
+
 @app.post("/admin/rotate_now")
-def rotate_identity_key_now(_: bool = Depends(verify_admin_access)):
+def rotate_identity_key_now(
+    request: Request,
+    credentials: HTTPBasicCredentials = Security(security),
+    x_admin_totp: Optional[str] = Header(default=None, alias="x-admin-totp"),
+):
     """Immediately rotate the server identity key (custom servers only).
 
     Generates a new Ed25519 keypair, creates a rotation announcement signed by the
@@ -2828,14 +3034,7 @@ def rotate_identity_key_now(_: bool = Depends(verify_admin_access)):
 
     Blocked on the public hub.
     """
-    if IS_PUBLIC_HUB:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Public hub uses a permanent long-term identity key. "
-                "Manual rotation is not permitted."
-            ),
-        )
+    _verify_identity_rotation_admin(request, credentials, x_admin_totp)
     try:
         return _perform_identity_key_rotation()
     except ValueError as exc:
@@ -2908,6 +3107,8 @@ async def get_signed_pin_list(
             "payload": base64.b64encode(fast_payload_json.encode()).decode(),
             "signature": base64.b64encode(fast_signature).decode(),
             "signing_key": base64.b64encode(fast_signing_key_raw).decode(),
+            "identity_public_key": base64.b64encode(fast_signing_key_raw).decode(),
+            "identity_key_version": 1,
             "pins": dict(TRANSPORT_PIN_HINTS),
             "auto_sync_default": PIN_SYNC_AUTO_DEFAULT,
             "force_manual_sync": PIN_SYNC_FORCE_MANUAL,
@@ -2964,6 +3165,8 @@ async def get_signed_pin_list(
         "payload": base64.b64encode(payload_json.encode()).decode(),
         "signature": base64.b64encode(signature).decode(),
         "signing_key": base64.b64encode(signing_public_key_raw).decode(),
+        "identity_public_key": base64.b64encode(signing_public_key_raw).decode(),
+        "identity_key_version": 1,
         "pins": dict(TRANSPORT_PIN_HINTS),
         "auto_sync_default": PIN_SYNC_AUTO_DEFAULT,
         "force_manual_sync": PIN_SYNC_FORCE_MANUAL,
@@ -3080,6 +3283,12 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             raw = await websocket.receive_text()
             msg = json.loads(raw)
+
+            if msg.get("type") == "ws_auth":
+                # Client auth can be sent by multiple guarded fallback paths on
+                # cold start. Once this socket is authenticated, duplicate auth
+                # frames are harmless and should not enter normal routing.
+                continue
 
             if msg.get("type") == "delivery_ack":
                 delivery_id = (msg.get("delivery_id") or "").strip()
@@ -3211,7 +3420,10 @@ async def websocket_endpoint(websocket: WebSocket):
             
             # System messages don't need ephemeral tokens (lightweight system messages)
             msg_type = msg.get("type")
-            if msg_type in ("delivery_receipt", "delete_message", "delivery_ack", "read_up_to", "read_up_to_ack"):
+            if _is_npk_protocol_control(msg):
+                msg = _enforce_protocol_control_silence(msg, str(uid))
+                msg_type = msg.get("type")
+            if msg_type in ("delivery_receipt", "delete_message", "delivery_ack", "read_up_to", "read_up_to_ack", "protocol_control"):
                 # System messages skip ephemeral token validation
                 pass
             else:
@@ -3237,6 +3449,10 @@ async def websocket_endpoint(websocket: WebSocket):
             is_sealed = msg.get("protocol_version") == 1 or msg.get("type") == "sealed_sender"
             if is_sealed:
                 preview_envelope_v1 = msg.get("preview_envelope_v1") if "preview_envelope_v1" in msg else None
+                preview_envelope_v2 = msg.get("preview_envelope_v2") if "preview_envelope_v2" in msg else None
+                encrypted_title = msg.get("encrypted_title") if "encrypted_title" in msg else None
+                preview_envelope_v2_only = msg.get("preview_envelope_v2_only") if "preview_envelope_v2_only" in msg else None
+                v2_preview_only = msg.get("v2_preview_only") if "v2_preview_only" in msg else None
                 # Sealed message: server sees only to_id and sealed_payload
                 # Do NOT inject from_id, do NOT verify sender identity
                 # Only recipient can decrypt and verify sender after delivery
@@ -3258,6 +3474,14 @@ async def websocket_endpoint(websocket: WebSocket):
                 }
                 if preview_envelope_v1 is not None:
                     msg["preview_envelope_v1"] = preview_envelope_v1
+                if preview_envelope_v2 is not None:
+                    msg["preview_envelope_v2"] = preview_envelope_v2
+                if encrypted_title is not None:
+                    msg["encrypted_title"] = encrypted_title
+                if preview_envelope_v2_only is not None:
+                    msg["preview_envelope_v2_only"] = preview_envelope_v2_only
+                if v2_preview_only is not None:
+                    msg["v2_preview_only"] = v2_preview_only
             else:
                 # Legacy unsealed messages (system messages, groups): server can see sender
                 msg["from_id"] = uid 
@@ -3331,7 +3555,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 pass
 
             if to_id:
-                if to_id != uid:
+                if to_id != uid and not _is_npk_protocol_control(msg) and msg.get("no_unread") is not True:
                     upsert_unread_message(
                         cursor=cursor,
                         user_id=str(to_id),
@@ -3356,6 +3580,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             "read_up_to_ack",
                             "delivery_ack",
                             "delete_message",
+                            "protocol_control",
                         )
                         # MessageType.reaction (msg_type == 9) must not be ack-tracked.
                         # If the delivery_ack never arrives (e.g. iOS backgrounds mid-flight),
@@ -3922,6 +4147,66 @@ class PendingAckRequest(BaseModel):
     lease_token: str
     message_ids: Optional[list[int]] = None
     ack_results: Optional[list[dict]] = None
+
+
+def _nested_preview_envelope(raw):
+    if isinstance(raw, dict):
+        envelope = raw.get("preview_envelope_v1")
+        if envelope is not None:
+            return envelope
+        for key in ("payload", "message", "data"):
+            envelope = _nested_preview_envelope(raw.get(key))
+            if envelope is not None:
+                return envelope
+        return None
+
+    if isinstance(raw, str):
+        try:
+            return _nested_preview_envelope(json.loads(raw))
+        except Exception:
+            return None
+
+    return None
+
+
+@app.get("/chat/peek_pending_preview_envelope")
+async def peek_pending_preview_envelope(
+    request: Request,
+    session_secret: str = Header(default=None, alias="session-secret"),
+    limit: int = 10,
+):
+    check_rate_limit(request, 40)
+    if not session_secret:
+        raise HTTPException(status_code=401)
+
+    valid, result = validate_session_token(session_secret)
+    if not valid:
+        raise HTTPException(status_code=401, detail=result)
+
+    user_id = result
+    safe_limit = max(1, min(limit, 10))
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT payload
+        FROM offline_messages
+        WHERE receiver_id=?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, safe_limit),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    for row in rows:
+        envelope = _nested_preview_envelope(row["payload"])
+        if envelope is not None:
+            return {"status": "ok", "preview_envelope_v1": envelope}
+
+    return {"status": "ok", "preview_envelope_v1": None}
 
 
 @app.get("/chat/get_pending_messages_v2")

@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import time
 from typing import Any, Optional
@@ -64,6 +65,17 @@ def _delegated_push_type(data_payload: Optional[dict[str, Any]]) -> str:
     return raw_type
 
 
+def _opaque_preview_envelope(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return str(value)
+
+
 def _delegated_push_payload(data_payload: Optional[dict[str, Any]]) -> dict[str, Any]:
     source = data_payload or {}
     payload: dict[str, Any] = {
@@ -74,9 +86,22 @@ def _delegated_push_payload(data_payload: Optional[dict[str, Any]]) -> dict[str,
         if value:
             payload[key] = value
     if "preview_envelope_v1" in source:
-        preview_envelope = source.get("preview_envelope_v1")
-        if preview_envelope not in (None, ""):
+        preview_envelope = _opaque_preview_envelope(source.get("preview_envelope_v1"))
+        if preview_envelope is not None:
             payload["preview_envelope_v1"] = preview_envelope
+    if "preview_envelope_v2" in source:
+        preview_envelope = _opaque_preview_envelope(source.get("preview_envelope_v2"))
+        if preview_envelope is not None:
+            payload["preview_envelope_v2"] = preview_envelope
+            payload["enc_v"] = "2"
+    if "encrypted_title" in source:
+        encrypted_title = _opaque_preview_envelope(source.get("encrypted_title"))
+        if encrypted_title is not None:
+            payload["encrypted_title"] = encrypted_title
+    for key in ("preview_envelope_v2_only", "v2_preview_only"):
+        value = source.get(key)
+        if value is not None:
+            payload[key] = value
     for key in ("reaction_event_key", "sender_ref"):
         value = str(source.get(key) or "").strip()
         if value:
@@ -87,13 +112,16 @@ def _delegated_push_payload(data_payload: Optional[dict[str, Any]]) -> dict[str,
 def should_send_push_for_message(msg: dict) -> bool:
     if not isinstance(msg, dict):
         return False
+    msg_type = str(msg.get("type") or "").strip().lower()
+    control_type = str(msg.get("control_type") or "").strip().lower()
+    if msg_type == "protocol_control" or control_type.startswith("npk_"):
+        return False
 
     raw_no_push = msg.get("no_push")
     no_push = raw_no_push is True or str(raw_no_push).strip().lower() == "true"
     if no_push:
         return False
 
-    msg_type = str(msg.get("type") or "").strip().lower()
     push_type = str(msg.get("push_type") or msg_type or "").strip().lower()
 
     if msg_type in {
