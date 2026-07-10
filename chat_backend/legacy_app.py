@@ -3998,49 +3998,51 @@ def reset(request: Request, _: bool = Depends(verify_admin_access)):
 @app.get("/chat/unread_count")
 async def get_unread_count(
     session_secret: str = Header(default=None, alias="session-secret"),
-    user_id: str = Header(default=None, alias="user-id"),
     username_hash: str = Header(default=None, alias="username-hash")
 ):
     # ⭐ FIXED: Cross-server unread checks need careful handling
     # Problem: Each server has its own user_id for the same user (separate DB)
     # Solution: Accept username_hash to look up the correct user_id on THIS server
-    
+    #
+    # SECURITY: the raw `user-id` header fallback was removed. /chat/lookup
+    # returns user_id to any caller, so accepting it here let anyone read an
+    # arbitrary user's unread count with no proof of ownership. The supported
+    # paths are an authenticated session-secret, or the cross-server
+    # username-hash lookup.
+
     resolved_user_id = None
-    
+
     if session_secret:
         # Try to validate session_secret first (most common case: current server)
         valid, result = validate_session_token(session_secret)
         if valid:
             resolved_user_id = result  # result is user_id
-    
-    # If session_secret validation failed, try alternative methods
+
+    # If session_secret validation failed, try the cross-server username_hash path.
     if resolved_user_id is None:
         if username_hash:
             # ⭐ FIXED: Apply SERVER_IDENTITY_SALT to username_hash to match what's in DB
             # The username_hash in DB is: HMAC(SERVER_IDENTITY_SALT, hashUsername(username))
             identity = get_secure_identity(username_hash)
-            
+
             conn = get_db()
             cursor = conn.cursor()
             cursor.execute("SELECT user_id FROM users WHERE username_hash=?", (identity,))
             user_row = cursor.fetchone()
             conn.close()
-            
+
             if user_row:
                 resolved_user_id = user_row["user_id"]
-        elif user_id:
-            # Fallback: Direct user_id (only works if same user_id across servers, rarely true)
-            resolved_user_id = user_id
-    
+
     # If we still don't have a user_id, reject
     if resolved_user_id is None:
-        raise HTTPException(status_code=401, detail="Must provide valid session-secret, username-hash, or user-id header")
+        raise HTTPException(status_code=401, detail="Must provide valid session-secret or username-hash header")
 
     conn = get_db()
     cursor = conn.cursor()
     count = get_user_unread_count(cursor=cursor, user_id=resolved_user_id)
     conn.close()
-    
+
     return {"status": "ok", "unread_count": count}
 
 
