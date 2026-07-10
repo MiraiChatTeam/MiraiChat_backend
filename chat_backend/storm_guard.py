@@ -197,9 +197,15 @@ def maybe_heal_global(get_db: Callable[[], object]) -> None:
     try:
         conn = get_db()
         cursor = conn.cursor()
-        now_iso = datetime.utcnow().isoformat()
-        cursor.execute("DELETE FROM ws_tickets WHERE used = 1 OR expires_at <= ?", (now_iso,))
-        cursor.execute("DELETE FROM pending_message_leases WHERE lease_expires_at <= ?", (now_iso,))
+        # ws_tickets.expires_at is written in LOCAL time (issue_ws_ticket uses
+        # datetime.now()) and read authoritatively in local time (the /ws auth
+        # path and cleanup_system). pending_message_leases.lease_expires_at is
+        # written and read in UTC. Using one basis for both would purge fresh
+        # tickets in any timezone behind UTC — keep each cleanup on its own basis.
+        ws_now_iso = datetime.now().isoformat()
+        utc_now_iso = datetime.utcnow().isoformat()
+        cursor.execute("DELETE FROM ws_tickets WHERE used = 1 OR expires_at <= ?", (ws_now_iso,))
+        cursor.execute("DELETE FROM pending_message_leases WHERE lease_expires_at <= ?", (utc_now_iso,))
         conn.commit()
     except Exception:
         try:
@@ -257,7 +263,7 @@ def maybe_heal_user_state(
 
         cursor.execute(
             "DELETE FROM ws_tickets WHERE user_id=? AND (used = 1 OR expires_at <= ?)",
-            (key, datetime.utcnow().isoformat()),
+            (key, datetime.now().isoformat()),
         )
 
         conn.commit()
