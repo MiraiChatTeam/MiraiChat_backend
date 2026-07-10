@@ -1196,6 +1196,37 @@ def _check_scheduled_rotation() -> None:
 def get_secure_identity(client_hash: str) -> str:
     return hmac.new(SERVER_IDENTITY_SALT.encode(), client_hash.encode(), hashlib.sha256).hexdigest()
 
+
+# Safe character set for a client-chosen user_id. Deliberately excludes SQL LIKE
+# metacharacters ('%', '_', '\\'), quotes and backslashes (which could escape the
+# JSON-substring LIKE patterns used in offline-message cleanup), and whitespace.
+_USER_ID_ALLOWED_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_USER_ID_MAX_LEN = 64
+
+
+def _resolve_registration_user_id(requested: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Resolve the user_id to persist at registration.
+
+    Clients may choose their own identifier (e.g. a preferred username), but it
+    must contain only safe characters: ASCII letters, digits, '.', '_' and '-',
+    up to 64 chars. This still allows custom names while preventing injection of
+    SQL LIKE wildcards ('%'/'_') or quote/backslash characters that would later
+    widen — or break out of — the JSON-substring LIKE patterns used by
+    offline-message cleanup in deregister/account_reset.
+
+    Returns (user_id, None) on success, or (None, error_message) when the value
+    is malformed. When nothing is supplied, a fresh server UUID is generated.
+    """
+    requested_user_id = (requested or "").strip()
+    if not requested_user_id:
+        return str(uuid.uuid4()), None
+    if len(requested_user_id) > _USER_ID_MAX_LEN:
+        return None, "Invalid user_id"
+    if not _USER_ID_ALLOWED_RE.match(requested_user_id):
+        return None, "Invalid user_id"
+    return requested_user_id, None
+
+
 def _receipt_hash(platform: str, verification_source: str, verification_data: str) -> str:
     base = f"{platform}|{verification_source}|{verification_data}".encode("utf-8")
     return hashlib.sha256(base).hexdigest()
@@ -2046,7 +2077,9 @@ async def register(request: Request, user: UserReg):
     cursor = conn.cursor()
     hashed_pw = bcrypt.hashpw(user.password.encode(), bcrypt.gensalt()).decode()
     identity = get_secure_identity(user.username_hash)
-    final_user_id = user.user_id if user.user_id else str(uuid.uuid4())
+    final_user_id, user_id_error = _resolve_registration_user_id(user.user_id)
+    if user_id_error:
+        return {"status": "error", "msg": user_id_error}
     try:
         cursor.execute(
             "INSERT INTO users (user_id, username_hash, password, public_key, storage_limit) VALUES (?, ?, ?, ?, ?)",
