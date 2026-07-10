@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import ipaddress
 import os
 import time
 from datetime import datetime, timedelta
@@ -18,10 +19,13 @@ from chat_backend.settings import (
     ADMIN_IP_ALLOWLIST,
     ADMIN_PASS_HASH,
     ADMIN_TOTP_SECRET,
+    CLOUDFLARE_IP_RANGES,
     REGISTER_RATE_LIMIT_MAX,
     REGISTER_RATE_LIMIT_WINDOW,
     SESSION_CACHE_TTL,
     SESSION_EXPIRY_DAYS,
+    TRUSTED_PROXY_CIDRS,
+    TRUSTED_PROXY_MODE,
 )
 
 
@@ -101,16 +105,65 @@ def _ensure_session_last_seen_column() -> None:
         conn.close()
 
 
+def _build_networks(cidrs: list[str]) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    networks = []
+    for cidr in cidrs:
+        try:
+            networks.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            print(f"[WARN] Ignoring invalid trusted-proxy CIDR: {cidr!r}")
+    return networks
+
+
+_TRUSTED_PROXY_NETWORKS = _build_networks(TRUSTED_PROXY_CIDRS)
+_CLOUDFLARE_NETWORKS = _build_networks(CLOUDFLARE_IP_RANGES)
+
+
+def _peer_ip(request: Request) -> str:
+    client = request.client
+    return client.host if client and client.host else "unknown"
+
+
+def _is_in_networks(value: str, networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return any(address in network for network in networks)
+
+
+def _header_ip(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return None
+
+
 def get_real_ip(request: Request) -> str:
-    ip = request.headers.get("X-Real-IP")
-    if ip:
-        return ip
+    """Return a client IP only from the deployment's configured trusted path."""
+    peer = _peer_ip(request)
 
-    xff = request.headers.get("X-Forwarded-For")
-    if xff:
-        return xff.split(",")[0].strip()
+    if TRUSTED_PROXY_MODE == "cloudflare_tunnel":
+        if _is_in_networks(peer, _TRUSTED_PROXY_NETWORKS):
+            return _header_ip(request.headers.get("CF-Connecting-IP")) or peer
+        return peer
 
-    return request.client.host
+    if TRUSTED_PROXY_MODE == "cloudflare_edge":
+        if _is_in_networks(peer, _CLOUDFLARE_NETWORKS):
+            return _header_ip(request.headers.get("CF-Connecting-IP")) or peer
+        return peer
+
+    if TRUSTED_PROXY_MODE == "xforwarded" and _is_in_networks(peer, _TRUSTED_PROXY_NETWORKS):
+        xff = request.headers.get("X-Forwarded-For")
+        if xff:
+            for value in reversed(xff.split(",")):
+                client_ip = _header_ip(value)
+                if client_ip:
+                    return client_ip
+
+    return peer
 
 
 def _get_request_ip(request: Request) -> str:

@@ -1196,6 +1196,23 @@ def _check_scheduled_rotation() -> None:
 def get_secure_identity(client_hash: str) -> str:
     return hmac.new(SERVER_IDENTITY_SALT.encode(), client_hash.encode(), hashlib.sha256).hexdigest()
 
+
+# Client-chosen IDs eventually occur in message payloads.  Keep their format
+# deliberately narrow; cleanup below also compares parsed JSON fields exactly.
+_USER_ID_ALLOWED_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_USER_ID_MAX_LEN = 64
+
+
+def _resolve_registration_user_id(requested: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Return a safe client-selected ID or generate a server UUID when absent."""
+    user_id = (requested or "").strip()
+    if not user_id:
+        return str(uuid.uuid4()), None
+    if len(user_id) > _USER_ID_MAX_LEN or not _USER_ID_ALLOWED_RE.fullmatch(user_id):
+        return None, "Invalid user_id"
+    return user_id, None
+
+
 def _receipt_hash(platform: str, verification_source: str, verification_data: str) -> str:
     base = f"{platform}|{verification_source}|{verification_data}".encode("utf-8")
     return hashlib.sha256(base).hexdigest()
@@ -2046,7 +2063,10 @@ async def register(request: Request, user: UserReg):
     cursor = conn.cursor()
     hashed_pw = bcrypt.hashpw(user.password.encode(), bcrypt.gensalt()).decode()
     identity = get_secure_identity(user.username_hash)
-    final_user_id = user.user_id if user.user_id else str(uuid.uuid4())
+    final_user_id, user_id_error = _resolve_registration_user_id(user.user_id)
+    if user_id_error:
+        conn.close()
+        return {"status": "error", "msg": user_id_error}
     try:
         cursor.execute(
             "INSERT INTO users (user_id, username_hash, password, public_key, storage_limit) VALUES (?, ?, ?, ?, ?)",
@@ -3794,20 +3814,9 @@ def deregister(user: UserLogin):
     for session_key, _ in list(connection_registry.get_user_sessions(uid).items()):
         connection_registry.remove(uid, session_key)
 
-    # Cleanup queued/offline payloads that reference this user as sender and/or target.
-    cursor.execute(
-        "SELECT id FROM offline_messages WHERE receiver_id=?",
-        (uid,),
-    )
-    owned_offline_ids = [int(r["id"]) for r in cursor.fetchall() if r["id"] is not None]
-
-    cursor.execute(
-        "SELECT id FROM offline_messages WHERE payload LIKE ? OR payload LIKE ?",
-        (f'%"from_id":"{uid}"%', f'%"to_id":"{uid}"%'),
-    )
-    referenced_offline_ids = [int(r["id"]) for r in cursor.fetchall() if r["id"] is not None]
-
-    all_offline_ids = sorted(set(owned_offline_ids + referenced_offline_ids))
+    # Exact JSON comparisons are safe even for legacy IDs containing LIKE or
+    # JSON metacharacters.  Do not reintroduce substring/LIKE matching here.
+    all_offline_ids = _collect_user_offline_message_ids(cursor, uid)
     if all_offline_ids:
         placeholders = ",".join("?" * len(all_offline_ids))
         cursor.execute(
@@ -3846,8 +3855,13 @@ def _collect_user_offline_message_ids(cursor: sqlite3.Cursor, user_id: str) -> l
     owned_ids = [int(r["id"]) for r in cursor.fetchall() if r["id"] is not None]
 
     cursor.execute(
-        "SELECT id FROM offline_messages WHERE payload LIKE ? OR payload LIKE ?",
-        (f'%\"from_id\":\"{user_id}\"%', f'%\"to_id\":\"{user_id}\"%'),
+        """
+        SELECT id FROM offline_messages
+        WHERE json_valid(payload)
+          AND (json_extract(payload, '$.from_id') = ?
+               OR json_extract(payload, '$.to_id') = ?)
+        """,
+        (user_id, user_id),
     )
     referenced_ids = [
         int(r["id"]) for r in cursor.fetchall() if r["id"] is not None
@@ -3998,7 +4012,6 @@ def reset(request: Request, _: bool = Depends(verify_admin_access)):
 @app.get("/chat/unread_count")
 async def get_unread_count(
     session_secret: str = Header(default=None, alias="session-secret"),
-    user_id: str = Header(default=None, alias="user-id"),
     username_hash: str = Header(default=None, alias="username-hash")
 ):
     # ⭐ FIXED: Cross-server unread checks need careful handling
@@ -4028,13 +4041,9 @@ async def get_unread_count(
             
             if user_row:
                 resolved_user_id = user_row["user_id"]
-        elif user_id:
-            # Fallback: Direct user_id (only works if same user_id across servers, rarely true)
-            resolved_user_id = user_id
-    
     # If we still don't have a user_id, reject
     if resolved_user_id is None:
-        raise HTTPException(status_code=401, detail="Must provide valid session-secret, username-hash, or user-id header")
+        raise HTTPException(status_code=401, detail="Must provide valid session-secret or username-hash header")
 
     conn = get_db()
     cursor = conn.cursor()

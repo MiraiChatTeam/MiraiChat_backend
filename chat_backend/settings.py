@@ -159,6 +159,42 @@ REGISTER_RATE_LIMIT_MAX = int(os.getenv("REGISTER_RATE_LIMIT_MAX", "10"))
 REGISTER_RATE_LIMIT_WINDOW = int(os.getenv("REGISTER_RATE_LIMIT_WINDOW", "3600"))
 WELCOME_MESSAGES_FILE = os.getenv("WELCOME_MESSAGES_FILE", "tools/.welcome_messages.json")
 
+# Client IPs affect rate limits and the admin IP allowlist, so forwarding
+# headers are trusted only after the socket peer matches an explicit boundary.
+#
+# cloudflare_tunnel (default): trust CF-Connecting-IP only from
+#                    TRUSTED_PROXY_CIDRS. The default CIDRs cover a local
+#                    cloudflared process; direct peers still cannot spoof it.
+# direct:            trust no forwarding header.
+# cloudflare_edge:   trust CF-Connecting-IP only from Cloudflare edge CIDRs.
+# xforwarded:        trust the final X-Forwarded-For value only from
+#                    TRUSTED_PROXY_CIDRS (the proxy must append/overwrite it).
+TRUSTED_PROXY_MODE = os.getenv("TRUSTED_PROXY_MODE", "cloudflare_tunnel").strip().lower()
+if TRUSTED_PROXY_MODE not in ("direct", "cloudflare_tunnel", "cloudflare_edge", "xforwarded"):
+    TRUSTED_PROXY_MODE = "cloudflare_tunnel"
+
+_DEFAULT_TRUSTED_PROXY_CIDRS = "127.0.0.0/8,::1/128"
+TRUSTED_PROXY_CIDRS = [
+    cidr.strip()
+    for cidr in os.getenv("TRUSTED_PROXY_CIDRS", _DEFAULT_TRUSTED_PROXY_CIDRS).split(",")
+    if cidr.strip()
+]
+
+# Cloudflare's published edge ranges, used only by cloudflare_edge mode.
+_DEFAULT_CLOUDFLARE_IP_RANGES = (
+    "173.245.48.0/20,103.21.244.0/22,103.22.200.0/22,103.31.4.0/22,"
+    "141.101.64.0/18,108.162.192.0/18,190.93.240.0/20,188.114.96.0/20,"
+    "197.234.240.0/22,198.41.128.0/17,162.158.0.0/15,104.16.0.0/13,"
+    "104.24.0.0/14,172.64.0.0/13,131.0.72.0/22,"
+    "2400:cb00::/32,2606:4700::/32,2803:f800::/32,2405:b500::/32,"
+    "2405:8100::/32,2a06:98c0::/29,2c0f:f248::/32"
+)
+CLOUDFLARE_IP_RANGES = [
+    cidr.strip()
+    for cidr in os.getenv("CLOUDFLARE_IP_RANGES", _DEFAULT_CLOUDFLARE_IP_RANGES).split(",")
+    if cidr.strip()
+]
+
 
 def ensure_upload_dir() -> None:
     os.makedirs(UPLOAD_DIR, exist_ok=True)
