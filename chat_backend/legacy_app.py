@@ -4,7 +4,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 import sqlite3, secrets, json, bcrypt, uuid, os, shutil, hmac, hashlib, time, base64
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -63,6 +63,7 @@ from chat_backend.settings import (
     DONATION_MONTHLY_PRIORITY_USERS,
     DONATION_MONTHLY_STORAGE_LIMIT,
     FILE_RETENTION_DAYS,
+    MAX_UPLOAD_FILE_BYTES,
     FILE_TOKEN_TTL_MINUTES,
     GOOGLE_PLAY_PACKAGE_NAME,
     GOOGLE_PLAY_SERVICE_ACCOUNT_JSON,
@@ -103,6 +104,19 @@ from chat_backend.settings import (
     _normalize_ws_host,
     _normalize_ws_origin,
     ensure_upload_dir,
+)
+from chat_backend.storage_streaming import (
+    PARTIAL_FILE_MAX_AGE_SECONDS,
+    UploadSizeExceeded,
+    cleanup_stale_partial_files,
+    commit_partial_file,
+    remove_file_if_present,
+    stream_upload_to_partial,
+)
+from chat_backend.resumable_uploads import (
+    build_resumable_upload_router,
+    cleanup_expired_upload_sessions,
+    purge_user_upload_sessions,
 )
 
 # Temporary in-memory storage for device linking (Handshake)
@@ -520,26 +534,25 @@ def _upsert_read_cursor(
     return advanced, applied_msg_id, applied_rank
 
 
-def _queue_offline_with_push(
+def _visible_notification_message_id(msg: dict) -> str:
+    if (
+        str(msg.get("protocol_kind") or "").strip() == "attachment_lifecycle_v1"
+        and str(msg.get("protocol_event_type") or "").strip() == "pending"
+    ):
+        attachment_message_id = str(msg.get("attachment_message_id") or "").strip()
+        if attachment_message_id:
+            return attachment_message_id
+    return str(msg.get("msg_id") or "").strip()
+
+
+def _build_push_job(
     *,
-    conn: sqlite3.Connection,
-    cursor: sqlite3.Cursor,
     to_id: str,
     sender_id: Optional[str],
-    payload: str,
     msg: dict,
     reason: str,
     exclude_session_secrets: Optional[set[str]] = None,
 ) -> Optional[dict]:
-    """Insert offline message and return a push job when policy allows."""
-    cursor.execute(
-        "INSERT INTO offline_messages (receiver_id, payload) VALUES (?, ?)",
-        (to_id, payload),
-    )
-
-    if reason == "missing_session":
-        _metric_inc("offline_routing_missing_session")
-
     try:
         push_enabled = bool(push_delivery_status().get("enabled"))
     except Exception as exc:
@@ -574,6 +587,35 @@ def _queue_offline_with_push(
         reason=f"policy_{reason}",
     )
     return None
+
+
+def _queue_offline_with_push(
+    *,
+    conn: sqlite3.Connection,
+    cursor: sqlite3.Cursor,
+    to_id: str,
+    sender_id: Optional[str],
+    payload: str,
+    msg: dict,
+    reason: str,
+    exclude_session_secrets: Optional[set[str]] = None,
+) -> Optional[dict]:
+    """Insert an offline payload and return a post-commit push job."""
+    cursor.execute(
+        "INSERT INTO offline_messages (receiver_id, payload) VALUES (?, ?)",
+        (to_id, payload),
+    )
+
+    if reason == "missing_session":
+        _metric_inc("offline_routing_missing_session")
+
+    return _build_push_job(
+        to_id=to_id,
+        sender_id=sender_id,
+        msg=msg,
+        reason=reason,
+        exclude_session_secrets=exclude_session_secrets,
+    )
 
 
 def _is_npk_protocol_control(msg: dict) -> bool:
@@ -621,8 +663,11 @@ def _build_delegated_push_metadata(msg: dict) -> dict:
         "enc_v": "2" if has_v2_envelope else "1",
     }
 
+    visible_message_id = _visible_notification_message_id(msg)
+    if visible_message_id:
+        push_data["msg_id"] = visible_message_id
+
     for source_key, output_key in (
-        ("msg_id", "msg_id"),
         ("conversation_id", "conversation_id"),
         ("group_id", "conversation_id"),
         ("groupId", "conversation_id"),
@@ -772,12 +817,109 @@ async def _register_pending_delivery_ack(
         }
 
 
+def _is_attachment_lifecycle_message(msg: dict) -> bool:
+    return str(msg.get("protocol_kind") or "").strip() == "attachment_lifecycle_v1"
+
+
+def _enforce_attachment_lifecycle_visibility(msg: dict) -> dict:
+    if not _is_attachment_lifecycle_message(msg):
+        return msg
+    normalized = dict(msg)
+    is_pending = str(normalized.get("protocol_event_type") or "").strip() == "pending"
+    normalized["no_unread"] = not is_pending
+    normalized["no_push"] = not is_pending
+    if is_pending:
+        normalized["notification_message_id"] = str(
+            normalized.get("attachment_message_id") or ""
+        ).strip()
+    return normalized
+
+
+def _attachment_unread_message(msg: dict) -> dict:
+    if not _is_attachment_lifecycle_message(msg):
+        return msg
+    tracked = dict(msg)
+    tracked["msg_id"] = _visible_notification_message_id(msg)
+    return tracked
+
+
+def _persist_attachment_lifecycle_message(
+    *, cursor: sqlite3.Cursor, sender_id: str, receiver_id: str, msg: dict, payload: str
+) -> tuple[str, str, bool]:
+    event_id = str(msg.get("protocol_event_id") or "").strip()
+    attachment_message_id = str(msg.get("attachment_message_id") or "").strip()
+    notification_message_id = str(msg.get("notification_message_id") or "").strip()
+    protocol_event_type = str(msg.get("protocol_event_type") or "").strip()
+    msg_id = str(msg.get("msg_id") or "").strip()
+    valid_id = re.compile(r"^[A-Za-z0-9_-]{8,160}$")
+    try:
+        msg_rank = int(msg.get("msg_rank")) if msg.get("msg_rank") is not None else None
+    except (TypeError, ValueError):
+        msg_rank = -1
+    if (not valid_id.fullmatch(event_id) or
+            not valid_id.fullmatch(attachment_message_id) or
+            not hmac.compare_digest(event_id, msg_id) or
+            protocol_event_type not in ("", "pending", "ready", "failed", "cancelled") or
+            (notification_message_id and
+             not hmac.compare_digest(notification_message_id, attachment_message_id)) or
+            (msg_rank is not None and msg_rank <= 0) or
+            len(payload.encode("utf-8")) > 2 * 1024 * 1024):
+        raise ValueError("invalid attachment lifecycle envelope")
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(days=2)).isoformat()
+    cursor.execute(
+        "SELECT offline_message_id FROM attachment_lifecycle_events "
+        "WHERE expires_at < ? AND offline_message_id IS NOT NULL",
+        (now.isoformat(),),
+    )
+    expired_ids = [row["offline_message_id"] for row in cursor.fetchall()]
+    if expired_ids:
+        cursor.executemany("DELETE FROM offline_messages WHERE id=?", [(value,) for value in expired_ids])
+    cursor.execute("DELETE FROM attachment_lifecycle_events WHERE expires_at < ?", (now.isoformat(),))
+    cursor.execute(
+        "SELECT 1 FROM attachment_lifecycle_events WHERE sender_id=? AND receiver_id=? AND event_id=?",
+        (sender_id, receiver_id, event_id),
+    )
+    if cursor.fetchone() is not None:
+        return event_id, now.isoformat(), False
+    cursor.execute("INSERT INTO offline_messages (receiver_id, payload) VALUES (?, ?)", (receiver_id, payload))
+    offline_message_id = cursor.lastrowid
+    cursor.execute(
+        "INSERT INTO attachment_lifecycle_events "
+        "(sender_id, receiver_id, event_id, attachment_message_id, payload, offline_message_id, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (sender_id, receiver_id, event_id, attachment_message_id, payload, offline_message_id, expires_at),
+    )
+    return event_id, now.isoformat(), True
+
+
 async def _consume_pending_delivery_ack(delivery_id: str) -> bool:
     async with _pending_delivery_lock:
-        existed = _pending_deliveries.pop(delivery_id, None) is not None
-    if existed:
+        delivery = _pending_deliveries.pop(delivery_id, None)
+    if delivery is not None:
         _metric_inc("delivery_ack_received")
-    return existed
+        msg = delivery.get("msg") if isinstance(delivery.get("msg"), dict) else {}
+        if _is_attachment_lifecycle_message(msg):
+            event_id = str(msg.get("protocol_event_id") or "").strip()
+            to_id = str(delivery.get("to_id") or "").strip()
+            sender_id = str(delivery.get("sender_id") or "").strip()
+            if event_id and to_id and sender_id:
+                conn = get_db(); cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT offline_message_id FROM attachment_lifecycle_events "
+                    "WHERE sender_id=? AND receiver_id=? AND event_id=?",
+                    (sender_id, to_id, event_id),
+                )
+                row = cursor.fetchone()
+                if row is not None and row["offline_message_id"] is not None:
+                    cursor.execute("DELETE FROM offline_messages WHERE id=? AND receiver_id=?", (row["offline_message_id"], to_id))
+                cursor.execute(
+                    "UPDATE attachment_lifecycle_events SET offline_message_id=NULL, delivered_at=CURRENT_TIMESTAMP "
+                    "WHERE sender_id=? AND receiver_id=? AND event_id=?",
+                    (sender_id, to_id, event_id),
+                )
+                conn.commit(); conn.close()
+    return delivery is not None
 
 
 async def _pending_delivery_timeout_worker() -> None:
@@ -810,6 +952,8 @@ async def _pending_delivery_timeout_worker() -> None:
                 msg = item.get("msg") if isinstance(item.get("msg"), dict) else {}
                 sender_id = item.get("sender_id")
                 if not to_id or not payload:
+                    continue
+                if _is_attachment_lifecycle_message(msg):
                     continue
                 fallback_count += 1
                 push_job = _queue_offline_with_push(
@@ -1451,6 +1595,22 @@ def cleanup_system():
     conn = get_db()
     cursor = conn.cursor()
     now = datetime.now()
+    stale_pending_cutoff = now - timedelta(seconds=PARTIAL_FILE_MAX_AGE_SECONDS)
+    cursor.execute(
+        "SELECT file_id, owner_id, file_size FROM file_registry "
+        "WHERE status='pending' AND upload_at < ?",
+        (stale_pending_cutoff,),
+    )
+    for row in cursor.fetchall():
+        fid, owner, fsize = row["file_id"], row["owner_id"], int(row["file_size"] or 0)
+        remove_file_if_present(os.path.join(UPLOAD_DIR, fid))
+        remove_file_if_present(os.path.join(UPLOAD_DIR, ".incoming", f"{fid}.part"))
+        cursor.execute(
+            "UPDATE users SET storage_used = MAX(0, storage_used - ?) WHERE user_id = ?",
+            (fsize, owner),
+        )
+        cursor.execute("DELETE FROM file_registry WHERE file_id = ?", (fid,))
+        cursor.execute("DELETE FROM file_download_tokens WHERE file_id = ?", (fid,))
     cursor.execute("SELECT file_id, owner_id, file_size FROM file_registry WHERE expires_at < ?", (now,))
     for row in cursor.fetchall():
         fid, owner, fsize = row["file_id"], row["owner_id"], row["file_size"]
@@ -1468,10 +1628,28 @@ def cleanup_system():
         "DELETE FROM offline_messages WHERE COALESCE(created_at, CURRENT_TIMESTAMP) < ?",
         (msg_expiry,),
     )
+    lifecycle_now = datetime.now(timezone.utc).isoformat()
+    cursor.execute(
+        "SELECT offline_message_id FROM attachment_lifecycle_events "
+        "WHERE expires_at < ? AND offline_message_id IS NOT NULL",
+        (lifecycle_now,),
+    )
+    expired_lifecycle_rows = [row["offline_message_id"] for row in cursor.fetchall()]
+    if expired_lifecycle_rows:
+        cursor.executemany(
+            "DELETE FROM offline_messages WHERE id=?",
+            [(row_id,) for row_id in expired_lifecycle_rows],
+        )
+    cursor.execute(
+        "DELETE FROM attachment_lifecycle_events WHERE expires_at < ?",
+        (lifecycle_now,),
+    )
     expired_links = [k for k, v in linking_blobs.items() if time.time() - v['t'] > 600]
     for k in expired_links: del linking_blobs[k]
     conn.commit()
     conn.close()
+    cleanup_stale_partial_files(UPLOAD_DIR)
+    cleanup_expired_upload_sessions()
 
 # --- Models ---
 class UserReg(BaseModel):
@@ -1498,6 +1676,23 @@ class AccountResetRequest(BaseModel):
 class LinkSubmit(BaseModel):
     link_id: str
     encrypted_blob: str
+
+class AttachmentDeviceProfileUpdate(BaseModel):
+    public_key: str
+    key_id: str
+    capabilities: List[str]
+
+class AttachmentDeviceEnvelopeSubmit(BaseModel):
+    envelope_id: str
+    target_device_id: str
+    target_key_id: str
+    payload: str
+
+class AttachmentDeviceEnvelopeAck(BaseModel):
+    envelope_ids: List[str]
+
+class AttachmentCapabilityQuery(BaseModel):
+    username_hashes: List[str]
 
 class BroadcastRequest(BaseModel):
     title: str
@@ -2146,6 +2341,10 @@ async def login(request: Request, user: UserLogin):
     
     # ⭐ CRITICAL FIX: Delete old sessions for this device FIRST
     # This ensures old session_secrets don't interfere with the new one
+    cursor.execute(
+        "DELETE FROM attachment_device_envelopes WHERE user_id=? AND (target_device_id=? OR source_device_id=?)",
+        (uid, normalized_device_id, normalized_device_id),
+    )
     cursor.execute("DELETE FROM sessions WHERE user_id = ? AND device_id = ?", (uid, normalized_device_id))
     conn.commit()
 
@@ -2254,6 +2453,168 @@ async def get_sender_certificate(session_secret: str = Header(default=None, alia
     encoded_cert = base64.b64encode(cert_payload.encode()).decode()
     encoded_sig = base64.b64encode(signature).decode()
     return {"status": "ok", "certificate": f"{encoded_cert}.{encoded_sig}"}
+
+_ATTACHMENT_CAPABILITIES = {"attachment_v2_read", "attachment_device_sync_v1", "attachment_lifecycle_v1"}
+
+
+def _attachment_v2_capability(cursor, user_id: str):
+    cursor.execute("SELECT attachment_capabilities FROM sessions WHERE user_id=?", (user_id,))
+    rows = cursor.fetchall(); supported = len(rows) > 0; common_capabilities = None
+    for row in rows:
+        try: capabilities = json.loads(row["attachment_capabilities"] or "[]")
+        except Exception: capabilities = []
+        if "attachment_v2_read" not in capabilities: supported = False
+        capability_set = set(str(value) for value in capabilities)
+        common_capabilities = capability_set if common_capabilities is None else common_capabilities.intersection(capability_set)
+    return supported, len(rows), sorted(common_capabilities or set())
+
+
+def _validate_attachment_device_profile(req: AttachmentDeviceProfileUpdate):
+    capabilities = sorted(set(str(v).strip() for v in req.capabilities if str(v).strip()))
+    if not capabilities or any(v not in _ATTACHMENT_CAPABILITIES for v in capabilities):
+        raise HTTPException(status_code=400, detail="invalid attachment capabilities")
+    try:
+        public_key_bytes = base64.b64decode(req.public_key, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid attachment public key")
+    if len(public_key_bytes) != 32:
+        raise HTTPException(status_code=400, detail="invalid attachment public key")
+    expected_key_id = hashlib.sha256(public_key_bytes).hexdigest()
+    if not hmac.compare_digest(expected_key_id, req.key_id.strip().lower()):
+        raise HTTPException(status_code=400, detail="attachment key id mismatch")
+    return capabilities, expected_key_id
+
+
+@app.post("/chat/attachment_device_profile")
+async def update_attachment_device_profile(req: AttachmentDeviceProfileUpdate, session_secret: str = Header(default=None, alias="session-secret")):
+    capabilities, key_id = _validate_attachment_device_profile(req)
+    conn = get_db(); cursor = conn.cursor()
+    cursor.execute("SELECT user_id, device_id FROM sessions WHERE session_secret=?", (session_secret,))
+    session = cursor.fetchone()
+    if not session:
+        conn.close(); raise HTTPException(status_code=401)
+    cursor.execute(
+        "UPDATE sessions SET attachment_public_key=?, attachment_key_id=?, attachment_capabilities=?, attachment_profile_updated_at=CURRENT_TIMESTAMP WHERE session_secret=?",
+        (req.public_key, key_id, json.dumps(capabilities), session_secret),
+    )
+    conn.commit(); conn.close()
+    return {"status": "ok", "device_id": session["device_id"], "key_id": key_id, "capabilities": capabilities}
+
+
+@app.post("/chat/attachment_capabilities")
+async def query_attachment_capabilities(req: AttachmentCapabilityQuery, session_secret: str = Header(default=None, alias="session-secret")):
+    hashes = list(dict.fromkeys(v.strip() for v in req.username_hashes if v.strip()))
+    if not hashes or len(hashes) > 256: raise HTTPException(status_code=400, detail="invalid capability query")
+    conn = get_db(); cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM sessions WHERE session_secret=?", (session_secret,))
+    if cursor.fetchone() is None:
+        conn.close(); raise HTTPException(status_code=401)
+    results = []
+    for username_hash in hashes:
+        identity = get_secure_identity(username_hash)
+        cursor.execute("SELECT user_id FROM users WHERE username_hash=?", (identity,))
+        user = cursor.fetchone(); supported, count, capabilities = (False, 0, [])
+        if user is not None: supported, count, capabilities = _attachment_v2_capability(cursor, user["user_id"])
+        results.append({"username_hash": username_hash, "supported": supported, "device_count": count, "capabilities": capabilities})
+    conn.close(); return {"status": "ok", "results": results}
+
+
+@app.get("/chat/attachment_devices")
+async def list_attachment_devices(session_secret: str = Header(default=None, alias="session-secret")):
+    conn = get_db(); cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM sessions WHERE session_secret=?", (session_secret,))
+    session = cursor.fetchone()
+    if not session:
+        conn.close(); raise HTTPException(status_code=401)
+    cursor.execute(
+        "SELECT device_id, attachment_public_key, attachment_key_id, attachment_capabilities, attachment_profile_updated_at FROM sessions WHERE user_id=? ORDER BY created_at ASC",
+        (session["user_id"],),
+    )
+    devices = []
+    for row in cursor.fetchall():
+        try: capabilities = json.loads(row["attachment_capabilities"] or "[]")
+        except Exception: capabilities = []
+        devices.append({"device_id": row["device_id"], "public_key": row["attachment_public_key"], "key_id": row["attachment_key_id"], "capabilities": capabilities, "updated_at": row["attachment_profile_updated_at"]})
+    conn.close()
+    return {"status": "ok", "devices": devices}
+
+
+@app.post("/chat/attachment_device_sync")
+async def submit_attachment_device_sync(req: AttachmentDeviceEnvelopeSubmit, session_secret: str = Header(default=None, alias="session-secret")):
+    envelope_id = req.envelope_id.strip(); target_device_id = req.target_device_id.strip(); target_key_id = req.target_key_id.strip().lower()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,160}", envelope_id): raise HTTPException(status_code=400, detail="invalid envelope id")
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,160}", target_device_id): raise HTTPException(status_code=400, detail="invalid target device")
+    if not re.fullmatch(r"[0-9a-f]{64}", target_key_id): raise HTTPException(status_code=400, detail="invalid target key")
+    if not req.payload or len(req.payload.encode("utf-8")) > 65536: raise HTTPException(status_code=400, detail="invalid envelope payload")
+    conn = get_db(); cursor = conn.cursor()
+    cursor.execute("SELECT user_id, device_id, attachment_key_id, attachment_capabilities FROM sessions WHERE session_secret=?", (session_secret,))
+    source = cursor.fetchone()
+    if not source:
+        conn.close(); raise HTTPException(status_code=401)
+    try: source_caps = json.loads(source["attachment_capabilities"] or "[]")
+    except Exception: source_caps = []
+    if "attachment_device_sync_v1" not in source_caps or not source["attachment_key_id"]:
+        conn.close(); raise HTTPException(status_code=409, detail="source device profile unavailable")
+    cursor.execute("SELECT session_secret, attachment_key_id, attachment_capabilities FROM sessions WHERE user_id=? AND device_id=?", (source["user_id"], target_device_id))
+    target = cursor.fetchone()
+    if not target or target["attachment_key_id"] != target_key_id:
+        conn.close(); raise HTTPException(status_code=409, detail="target device profile changed")
+    try: target_caps = json.loads(target["attachment_capabilities"] or "[]")
+    except Exception: target_caps = []
+    if "attachment_device_sync_v1" not in target_caps:
+        conn.close(); raise HTTPException(status_code=409, detail="target device does not support sync")
+    expires_at = (datetime.now() + timedelta(days=30)).isoformat()
+    cursor.execute("DELETE FROM attachment_device_envelopes WHERE expires_at < ?", (datetime.now().isoformat(),))
+    cursor.execute("SELECT payload FROM attachment_device_envelopes WHERE user_id=? AND target_device_id=? AND envelope_id=?", (source["user_id"], target_device_id, envelope_id))
+    existing = cursor.fetchone()
+    if existing is None:
+        cursor.execute("SELECT COUNT(*) AS count FROM attachment_device_envelopes WHERE user_id=? AND target_device_id=?", (source["user_id"], target_device_id))
+        if int(cursor.fetchone()["count"] or 0) >= 1000:
+            conn.close(); raise HTTPException(status_code=429, detail="attachment sync mailbox full")
+    cursor.execute(
+        "INSERT OR IGNORE INTO attachment_device_envelopes (envelope_id, user_id, source_device_id, target_device_id, target_key_id, payload, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (envelope_id, source["user_id"], source["device_id"], target_device_id, target_key_id, req.payload, expires_at),
+    )
+    cursor.execute("SELECT payload FROM attachment_device_envelopes WHERE user_id=? AND target_device_id=? AND envelope_id=?", (source["user_id"], target_device_id, envelope_id))
+    persisted = cursor.fetchone()
+    conn.commit(); target_secret = target["session_secret"]
+    event = json.dumps({"type": "attachment_device_sync", "envelope_id": envelope_id, "target_device_id": target_device_id, "payload": persisted["payload"]})
+    if connection_registry.has(source["user_id"], target_secret):
+        socket = connection_registry.get_socket(source["user_id"], target_secret)
+        if socket is not None:
+            try: await socket.send_text(event)
+            except Exception: pass
+    conn.close()
+    return {"status": "ok", "envelope_id": envelope_id}
+
+
+@app.get("/chat/attachment_device_sync/pending")
+async def get_pending_attachment_device_sync(session_secret: str = Header(default=None, alias="session-secret")):
+    conn = get_db(); cursor = conn.cursor()
+    cursor.execute("SELECT user_id, device_id, attachment_key_id FROM sessions WHERE session_secret=?", (session_secret,))
+    session = cursor.fetchone()
+    if not session:
+        conn.close(); raise HTTPException(status_code=401)
+    now = datetime.now().isoformat(); cursor.execute("DELETE FROM attachment_device_envelopes WHERE expires_at < ?", (now,))
+    cursor.execute("SELECT envelope_id, payload FROM attachment_device_envelopes WHERE user_id=? AND target_device_id=? AND target_key_id=? ORDER BY id ASC LIMIT 100", (session["user_id"], session["device_id"], session["attachment_key_id"] or ""))
+    rows = cursor.fetchall(); conn.commit(); conn.close()
+    return {"status": "ok", "envelopes": [dict(row) for row in rows]}
+
+
+@app.post("/chat/attachment_device_sync/ack")
+async def ack_attachment_device_sync(req: AttachmentDeviceEnvelopeAck, session_secret: str = Header(default=None, alias="session-secret")):
+    envelope_ids = [v.strip() for v in req.envelope_ids[:100] if v.strip()]
+    conn = get_db(); cursor = conn.cursor()
+    cursor.execute("SELECT user_id, device_id FROM sessions WHERE session_secret=?", (session_secret,))
+    session = cursor.fetchone()
+    if not session:
+        conn.close(); raise HTTPException(status_code=401)
+    if envelope_ids:
+        placeholders = ",".join("?" for _ in envelope_ids)
+        cursor.execute(f"DELETE FROM attachment_device_envelopes WHERE user_id=? AND target_device_id=? AND envelope_id IN ({placeholders})", (session["user_id"], session["device_id"], *envelope_ids))
+    conn.commit(); conn.close()
+    return {"status": "ok", "acked": len(envelope_ids)}
+
 
 @app.get("/chat/list_devices")
 async def list_devices(session_secret: str = Header(default=None, alias="session-secret")):
@@ -2379,6 +2740,11 @@ async def kill_device(target_device_id: str, session_secret: str = Header(defaul
             if socket is not None:
                 await socket.send_text(json.dumps({"type": "remote_wipe"}))
         cursor.execute("DELETE FROM sessions WHERE session_secret=?", (target_session_secret,))
+        cursor.execute(
+            "DELETE FROM attachment_device_envelopes WHERE user_id=? "
+            "AND (target_device_id=? OR source_device_id=?)",
+            (uid, target_device_id, target_device_id),
+        )
         session_cache_invalidate(target_session_secret)
         conn.commit()
     conn.close()
@@ -2605,6 +2971,15 @@ async def lookup_id(
     identity = get_secure_identity(h)
     cursor.execute("SELECT user_id, public_key FROM users WHERE username_hash=?", (identity,))
     row = cursor.fetchone()
+    attachment_v2_supported = False
+    attachment_device_count = 0
+    if row and session_secret:
+        cursor.execute("SELECT 1 FROM sessions WHERE session_secret=?", (session_secret,))
+        requester_authenticated = cursor.fetchone() is not None
+        if requester_authenticated:
+            attachment_v2_supported, attachment_device_count, _ = (
+                _attachment_v2_capability(cursor, row["user_id"])
+            )
     conn.close()
     if row: 
         # ⭐ FIXED: Include this server's domain so client knows where user is registered
@@ -2612,11 +2987,27 @@ async def lookup_id(
             "status": "ok",
             "user_id": row["user_id"],
             "public_key": row["public_key"],
+            "attachment_v2_supported": attachment_v2_supported,
+            "attachment_device_count": attachment_device_count,
             "server_domain": PUBLIC_HUB_URL if IS_PUBLIC_HUB else "local",
         }
     return {"status": "error", "msg": "not found"}
 
 # --- Storage Endpoints ---
+app.include_router(build_resumable_upload_router(_get_effective_storage_limit))
+
+def _storage_file_response(file_path: str, content_sha256: Optional[str]) -> FileResponse:
+    headers = {}
+    if content_sha256:
+        headers["X-Content-SHA256"] = content_sha256
+    return FileResponse(
+        file_path,
+        media_type="application/octet-stream",
+        filename="encrypted_blob.bin",
+        headers=headers,
+    )
+
+
 @app.post("/storage/upload")
 async def upload_file(
     background_tasks: BackgroundTasks,
@@ -2630,15 +3021,29 @@ async def upload_file(
     user = cursor.fetchone()
     if not user:
         conn.close(); raise HTTPException(status_code=401)
-    file_content = await file.read()
-    file_size = len(file_content)
     effective_limit = _get_effective_storage_limit(cursor, user["user_id"])
-    if user["storage_used"] + file_size > effective_limit:
-        conn.close(); return {"status": "error", "msg": "Limit exceeded"}
+    preliminary_remaining = max(0, effective_limit - int(user["storage_used"] or 0))
+    user_id = user["user_id"]
+    conn.close()
+
     file_id = str(uuid.uuid4())
-    file_path = os.path.join(UPLOAD_DIR, file_id)
-    with open(file_path, "wb") as buffer:
-        buffer.write(file_content)
+    try:
+        streamed = await stream_upload_to_partial(
+            file,
+            UPLOAD_DIR,
+            file_id,
+            max_bytes=min(MAX_UPLOAD_FILE_BYTES, preliminary_remaining),
+        )
+    except UploadSizeExceeded as exc:
+        return JSONResponse(
+            status_code=413,
+            content={"status": "error", "msg": str(exc)},
+        )
+    except Exception:
+        remove_file_if_present(os.path.join(UPLOAD_DIR, ".incoming", f"{file_id}.part"))
+        raise HTTPException(status_code=500, detail="Upload stream failed")
+
+    file_size = streamed.size_bytes
     expiry = datetime.now() + timedelta(days=FILE_RETENTION_DAYS)
     label = (storage_label or "").strip().lower()
     if label == "temporary_image":
@@ -2646,16 +3051,95 @@ async def upload_file(
     else:
         stored_filename = "Unknown Encrypted File"
 
-    cursor.execute("INSERT INTO file_registry (file_id, owner_id, filename, file_size, expires_at) VALUES (?, ?, ?, ?, ?)",
-                   (file_id, user["user_id"], stored_filename, file_size, expiry))
-    download_token = secrets.token_urlsafe(32)
-    token_expiry = datetime.now() + timedelta(minutes=FILE_TOKEN_TTL_MINUTES)
-    cursor.execute("INSERT INTO file_download_tokens (token, file_id, expires_at) VALUES (?, ?, ?)",
-                   (download_token, file_id, token_expiry))
-    cursor.execute("UPDATE users SET storage_used = storage_used + ? WHERE user_id = ?", (file_size, user["user_id"]))
-    conn.commit(); conn.close()
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT storage_used FROM users WHERE user_id=?", (user_id,))
+        current_user = cursor.fetchone()
+        if not current_user:
+            conn.rollback()
+            remove_file_if_present(streamed.partial_path)
+            raise HTTPException(status_code=401)
+        current_used = int(current_user["storage_used"] or 0)
+        effective_limit = _get_effective_storage_limit(cursor, user_id)
+        if current_used + file_size > effective_limit:
+            conn.rollback()
+            remove_file_if_present(streamed.partial_path)
+            return JSONResponse(
+                status_code=413,
+                content={"status": "error", "msg": "Limit exceeded"},
+            )
+        cursor.execute(
+            "INSERT INTO file_registry "
+            "(file_id, owner_id, filename, file_size, expires_at, status, content_sha256) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            (file_id, user_id, stored_filename, file_size, expiry, streamed.sha256_hex),
+        )
+        cursor.execute(
+            "UPDATE users SET storage_used = storage_used + ? WHERE user_id = ?",
+            (file_size, user_id),
+        )
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        remove_file_if_present(streamed.partial_path)
+        raise HTTPException(status_code=500, detail="Upload reservation failed")
+    finally:
+        conn.close()
+
+    final_path = None
+    try:
+        final_path = commit_partial_file(streamed.partial_path, UPLOAD_DIR, file_id)
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            "UPDATE file_registry SET status='ready' WHERE file_id=? AND status='pending'",
+            (file_id,),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("Upload reservation disappeared")
+        download_token = secrets.token_urlsafe(32)
+        token_expiry = datetime.now() + timedelta(minutes=FILE_TOKEN_TTL_MINUTES)
+        cursor.execute("INSERT INTO file_download_tokens (token, file_id, expires_at) VALUES (?, ?, ?)",
+                       (download_token, file_id, token_expiry))
+        conn.commit()
+        conn.close()
+    except Exception:
+        try:
+            conn.rollback()
+            conn.close()
+        except Exception:
+            pass
+        remove_file_if_present(final_path)
+        remove_file_if_present(streamed.partial_path)
+        rollback_conn = get_db()
+        rollback_cursor = rollback_conn.cursor()
+        rollback_cursor.execute("BEGIN IMMEDIATE")
+        rollback_cursor.execute(
+            "DELETE FROM file_registry WHERE file_id=? AND status='pending'",
+            (file_id,),
+        )
+        if rollback_cursor.rowcount:
+            rollback_cursor.execute(
+                "UPDATE users SET storage_used = MAX(0, storage_used - ?) WHERE user_id=?",
+                (file_size, user_id),
+            )
+        rollback_conn.commit()
+        rollback_conn.close()
+        raise HTTPException(status_code=500, detail="Upload commit failed")
+
     background_tasks.add_task(cleanup_system)
-    return {"status": "ok", "file_id": file_id, "size": file_size, "download_token": download_token}
+    return {
+        "status": "ok",
+        "file_id": file_id,
+        "size": file_size,
+        "sha256": streamed.sha256_hex,
+        "download_token": download_token,
+    }
 
 @app.get("/storage/download/{file_id}")
 async def download_file(file_id: str, session_secret: str = Header(default=None, alias="session-secret"), token: Optional[str] = None):
@@ -2665,21 +3149,26 @@ async def download_file(file_id: str, session_secret: str = Header(default=None,
 
     if token:
         cursor.execute(
-            "SELECT t.file_id FROM file_download_tokens t JOIN file_registry f ON f.file_id = t.file_id "
-            "WHERE t.token=? AND t.file_id=? AND t.expires_at > ? AND f.expires_at > ?",
+            "SELECT t.file_id, f.content_sha256, f.owner_id, f.file_size "
+            "FROM file_download_tokens t JOIN file_registry f ON f.file_id = t.file_id "
+            "WHERE t.token=? AND t.file_id=? AND t.expires_at > ? AND f.expires_at > ? AND f.status='ready'",
             (token, file_id, now, now)
         )
         token_row = cursor.fetchone()
         if token_row:
             file_path = os.path.join(UPLOAD_DIR, file_id)
             if not os.path.exists(file_path):
+                cursor.execute(
+                    "UPDATE users SET storage_used = MAX(0, storage_used - ?) WHERE user_id=?",
+                    (int(token_row["file_size"] or 0), token_row["owner_id"]),
+                )
                 cursor.execute("DELETE FROM file_registry WHERE file_id = ?", (file_id,))
                 cursor.execute("DELETE FROM file_download_tokens WHERE file_id = ?", (file_id,))
                 conn.commit()
                 conn.close()
                 raise HTTPException(status_code=404, detail="File expired or deleted")
             conn.close()
-            return FileResponse(file_path)
+            return _storage_file_response(file_path, token_row["content_sha256"])
         conn.close()
         raise HTTPException(status_code=403, detail="Invalid or expired token")
 
@@ -2693,11 +3182,15 @@ async def download_file(file_id: str, session_secret: str = Header(default=None,
     user_id = result
 
     # Verify file exists AND user owns it
-    cursor.execute("SELECT owner_id, filename, expires_at FROM file_registry WHERE file_id=?", (file_id,))
+    cursor.execute("SELECT owner_id, filename, file_size, expires_at, content_sha256 FROM file_registry WHERE file_id=? AND status='ready'", (file_id,))
     file_row = cursor.fetchone()
     if not file_row:
         conn.close(); raise HTTPException(status_code=404)
     if file_row["expires_at"] is not None and datetime.fromisoformat(str(file_row["expires_at"])) <= now:
+        cursor.execute(
+            "UPDATE users SET storage_used = MAX(0, storage_used - ?) WHERE user_id=?",
+            (int(file_row["file_size"] or 0), file_row["owner_id"]),
+        )
         cursor.execute("DELETE FROM file_registry WHERE file_id = ?", (file_id,))
         cursor.execute("DELETE FROM file_download_tokens WHERE file_id = ?", (file_id,))
         conn.commit()
@@ -2707,13 +3200,17 @@ async def download_file(file_id: str, session_secret: str = Header(default=None,
 
     file_path = os.path.join(UPLOAD_DIR, file_id)
     if not os.path.exists(file_path):
+        cursor.execute(
+            "UPDATE users SET storage_used = MAX(0, storage_used - ?) WHERE user_id=?",
+            (int(file_row["file_size"] or 0), file_row["owner_id"]),
+        )
         cursor.execute("DELETE FROM file_registry WHERE file_id = ?", (file_id,))
         cursor.execute("DELETE FROM file_download_tokens WHERE file_id = ?", (file_id,))
         conn.commit()
         conn.close(); raise HTTPException(status_code=404, detail="File expired or deleted")
 
     conn.close()
-    return FileResponse(file_path)
+    return _storage_file_response(file_path, file_row["content_sha256"])
 
 @app.get("/storage/list")
 async def list_files(session_secret: str = Header(default=None, alias="session-secret")):
@@ -2728,7 +3225,7 @@ async def list_files(session_secret: str = Header(default=None, alias="session-s
     cursor = conn.cursor()
     cursor.execute(
         "SELECT file_id, filename, file_size, upload_at, expires_at "
-        "FROM file_registry WHERE owner_id=? AND expires_at > ?",
+        "FROM file_registry WHERE owner_id=? AND expires_at > ? AND status='ready'",
         (user_id, datetime.now())
     )
     files = cursor.fetchall()
@@ -3473,6 +3970,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 encrypted_title = msg.get("encrypted_title") if "encrypted_title" in msg else None
                 preview_envelope_v2_only = msg.get("preview_envelope_v2_only") if "preview_envelope_v2_only" in msg else None
                 v2_preview_only = msg.get("v2_preview_only") if "v2_preview_only" in msg else None
+                lifecycle_outer_hints = {
+                    key: msg.get(key)
+                    for key in (
+                        "protocol_kind", "protocol_event_id", "attachment_message_id",
+                        "protocol_recipient", "protocol_event_type",
+                        "notification_message_id", "msg_rank",
+                        "no_unread", "no_push",
+                    )
+                    if key in msg
+                }
                 # Sealed message: server sees only to_id and sealed_payload
                 # Do NOT inject from_id, do NOT verify sender identity
                 # Only recipient can decrypt and verify sender after delivery
@@ -3492,6 +3999,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     # sealed envelope; it is only used for unread tracking and push.
                     "msg_id": msg.get("msg_id"),
                 }
+                msg.update(lifecycle_outer_hints)
                 if preview_envelope_v1 is not None:
                     msg["preview_envelope_v1"] = preview_envelope_v1
                 if preview_envelope_v2 is not None:
@@ -3505,6 +4013,8 @@ async def websocket_endpoint(websocket: WebSocket):
             else:
                 # Legacy unsealed messages (system messages, groups): server can see sender
                 msg["from_id"] = uid 
+
+            msg = _enforce_attachment_lifecycle_visibility(msg)
             
             # Mark start time for routing latency measurement (send-to-deliver path)
             _t_route_start = time.time()
@@ -3523,6 +4033,31 @@ async def websocket_endpoint(websocket: WebSocket):
                         f"[INFO] Blocked direct message sender={uid} recipient={to_id} "
                         f"msg_id={blocked_msg_id or 'n/a'}"
                     )
+                    continue
+
+            lifecycle_persisted = False
+            lifecycle_inserted = False
+            if to_id and _is_attachment_lifecycle_message(msg):
+                try:
+                    event_id, persisted_at, lifecycle_inserted = _persist_attachment_lifecycle_message(
+                        cursor=cursor,
+                        sender_id=str(uid),
+                        receiver_id=str(to_id),
+                        msg=msg,
+                        payload=payload,
+                    )
+                    conn.commit()
+                    lifecycle_persisted = True
+                    await websocket.send_text(json.dumps({
+                        "type": "attachment_lifecycle_persisted",
+                        "event_id": event_id,
+                        "attachment_message_id": str(msg.get("attachment_message_id") or ""),
+                        "recipient": str(msg.get("protocol_recipient") or "").strip(),
+                        "persisted_at": persisted_at,
+                    }))
+                except Exception as lifecycle_error:
+                    conn.rollback()
+                    print(f"[WARN] lifecycle persistence rejected user={uid}: {lifecycle_error}")
                     continue
 
             if msg_type == "delivery_receipt" and to_id:
@@ -3575,12 +4110,17 @@ async def websocket_endpoint(websocket: WebSocket):
                                 pass
 
             if to_id:
-                if to_id != uid and not _is_npk_protocol_control(msg) and msg.get("no_unread") is not True:
+                if (
+                    to_id != uid
+                    and not _is_npk_protocol_control(msg)
+                    and msg.get("no_unread") is not True
+                    and (not lifecycle_persisted or lifecycle_inserted)
+                ):
                     upsert_unread_message(
                         cursor=cursor,
                         user_id=str(to_id),
                         sender_id=str(uid),
-                        msg=msg,
+                        msg=_attachment_unread_message(msg),
                     )
 
                 # Recipient session rows may be stale/missing; route by live socket first.
@@ -3670,16 +4210,26 @@ async def websocket_endpoint(websocket: WebSocket):
                     if target_server and target_server != PUBLIC_HUB_URL:
                         print(f"ℹ️ User {to_id} not active on this server. Message targeted for {target_server}")
                     reason = "missing_session" if not dest_sessions else "no_active_socket"
-                    push_job = _queue_offline_with_push(
-                        conn=conn,
-                        cursor=cursor,
-                        to_id=to_id,
-                        sender_id=uid,
-                        payload=payload,
-                        msg=msg,
-                        reason=reason,
-                        exclude_session_secrets=delivered_online_session_secrets,
-                    )
+                    push_job = None
+                    if not lifecycle_persisted:
+                        push_job = _queue_offline_with_push(
+                            conn=conn,
+                            cursor=cursor,
+                            to_id=to_id,
+                            sender_id=uid,
+                            payload=payload,
+                            msg=msg,
+                            reason=reason,
+                            exclude_session_secrets=delivered_online_session_secrets,
+                        )
+                    elif lifecycle_inserted:
+                        push_job = _build_push_job(
+                            to_id=to_id,
+                            sender_id=uid,
+                            msg=msg,
+                            reason=reason,
+                            exclude_session_secrets=delivered_online_session_secrets,
+                        )
                     conn.commit()
                     if push_job:
                         try:
@@ -3690,7 +4240,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     conn.commit()
                     should_push = (
                         to_id != uid and
-                        should_send_push_for_message(msg)
+                        should_send_push_for_message(msg) and
+                        (not lifecycle_persisted or lifecycle_inserted)
                     )
                     if should_push:
                         try:
@@ -3837,8 +4388,10 @@ def deregister(user: UserLogin):
     cursor.execute("DELETE FROM pending_message_leases WHERE receiver_id=?", (uid,))
     
     # Corrected DELETE statements with bindings
+    purge_user_upload_sessions(cursor, uid)
     cursor.execute("DELETE FROM users WHERE user_id=?", (uid,))
     cursor.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+    cursor.execute("DELETE FROM attachment_device_envelopes WHERE user_id=?", (uid,))
     cursor.execute("DELETE FROM offline_messages WHERE receiver_id=?", (uid,))
     cursor.execute("DELETE FROM file_registry WHERE owner_id=?", (uid,))
     
@@ -3871,6 +4424,7 @@ def _collect_user_offline_message_ids(cursor: sqlite3.Cursor, user_id: str) -> l
 
 
 def _remove_user_owned_files(cursor: sqlite3.Cursor, user_id: str) -> int:
+    purge_user_upload_sessions(cursor, user_id)
     cursor.execute("SELECT file_id FROM file_registry WHERE owner_id=?", (user_id,))
     file_ids = [str(r["file_id"]) for r in cursor.fetchall() if r["file_id"]]
     if not file_ids:
@@ -3969,6 +4523,7 @@ def account_reset(
     cursor.execute("SELECT COUNT(*) AS c FROM sessions WHERE user_id=?", (user_id,))
     sessions_cleared = int((cursor.fetchone() or {"c": 0})["c"] or 0)
     cursor.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+    cursor.execute("DELETE FROM attachment_device_envelopes WHERE user_id=?", (user_id,))
 
     conn.commit()
     conn.close()

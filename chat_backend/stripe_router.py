@@ -1,4 +1,5 @@
 import os
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Header, HTTPException, Request
 
@@ -7,6 +8,24 @@ from chat_backend.database import get_db
 
 
 router = APIRouter(prefix="/stripe", tags=["stripe"])
+
+_MAX_DONATION_MINOR = 100000000
+_SUPPORTED_DONATION_CURRENCIES = {
+    "aed", "aud", "cad", "chf", "eur", "gbp", "hkd", "inr", "jpy",
+    "nzd", "sar", "sgd", "usd",
+}
+
+
+def _is_valid_redirect_url(raw: str) -> bool:
+    parsed = urlsplit((raw or "").strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _append_query_param(url: str, key: str, value: str) -> str:
+    parsed = urlsplit(url)
+    params = parse_qsl(parsed.query, keep_blank_values=True)
+    params.append((key, value))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(params), parsed.fragment))
 
 
 def _read_env(name: str) -> str:
@@ -114,6 +133,84 @@ async def create_payment_intent(
         "publishable_key": stripe_publishable_key,
         "currency": "jpy",
     }
+
+
+@router.post("/create-checkout-session")
+async def create_checkout_session(request: Request, payload: dict):
+    check_rate_limit(request, 20)
+
+    stripe_secret_key = _read_env("STRIPE_SECRET_KEY")
+    if not stripe_secret_key:
+        return {
+            "status": "error",
+            "msg": "Payment backend is not configured (missing STRIPE_SECRET_KEY)",
+        }
+
+    currency = str(payload.get("currency") or "jpy").strip().lower()
+    if currency not in _SUPPORTED_DONATION_CURRENCIES:
+        return {"status": "error", "msg": "Unsupported currency"}
+    amount_raw = payload.get("amount_minor")
+    if amount_raw is None and currency == "jpy":
+        amount_raw = payload.get("amount_jpy")
+    try:
+        amount_minor = int(amount_raw)
+    except Exception:
+        return {"status": "error", "msg": "amount_minor must be an integer"}
+    if amount_minor < 50:
+        return {"status": "error", "msg": "Amount too small"}
+    if amount_minor > _MAX_DONATION_MINOR:
+        return {"status": "error", "msg": "Amount too large"}
+
+    redirect_url = str(payload.get("redirect") or "").strip()
+    origin = (request.headers.get("origin") or "").strip().rstrip("/")
+    if _is_valid_redirect_url(redirect_url):
+        success_url = _append_query_param(redirect_url, "status", "success")
+        cancel_url = _append_query_param(redirect_url, "status", "cancel")
+    elif origin:
+        success_url = f"{origin}/donate?status=success"
+        cancel_url = f"{origin}/donate?status=cancel"
+    else:
+        return {"status": "error", "msg": "A valid checkout redirect URL is required"}
+
+    donation_type = str(payload.get("donation_type") or "once").strip().lower()
+    if donation_type not in ("once", "monthly"):
+        donation_type = "once"
+    metadata = {
+        "type": "donation",
+        "donation_type": donation_type,
+        "amount_minor": str(amount_minor),
+        "currency": currency,
+    }
+
+    try:
+        import stripe
+
+        stripe.api_key = stripe_secret_key
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            success_url=success_url,
+            cancel_url=cancel_url,
+            line_items=[{
+                "quantity": 1,
+                "price_data": {
+                    "currency": currency,
+                    "unit_amount": amount_minor,
+                    "product_data": {
+                        "name": "Donation",
+                        "description": "Support MiraiChat",
+                    },
+                },
+            }],
+            metadata=metadata,
+            payment_intent_data={"metadata": metadata},
+        )
+    except Exception as exc:
+        return {"status": "error", "msg": f"Stripe error: {exc}"}
+
+    checkout_url = str(getattr(session, "url", "") or "").strip()
+    if not checkout_url:
+        return {"status": "error", "msg": "Stripe checkout URL is unavailable"}
+    return {"url": checkout_url}
 
 
 @router.post("/webhook")

@@ -46,6 +46,10 @@ def init_db() -> None:
             notification_key TEXT,
             notification_key_version INTEGER DEFAULT 1,
             grace_period_expires DATETIME,
+            attachment_public_key TEXT,
+            attachment_key_id TEXT,
+            attachment_capabilities TEXT,
+            attachment_profile_updated_at DATETIME,
             PRIMARY KEY (user_id, device_id)
         )
     """)
@@ -104,6 +108,25 @@ def init_db() -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_offline_messages_receiver_id ON offline_messages(receiver_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_offline_messages_receiver_id_id ON offline_messages(receiver_id, id)")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attachment_lifecycle_events (
+            sender_id TEXT NOT NULL,
+            receiver_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            attachment_message_id TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            offline_message_id INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME NOT NULL,
+            delivered_at DATETIME,
+            PRIMARY KEY (sender_id, receiver_id, event_id)
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attachment_lifecycle_receiver "
+        "ON attachment_lifecycle_events(receiver_id, expires_at)"
+    )
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_conversation_read_state_user_peer ON conversation_read_state(user_id, peer_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_unread_messages_user_id ON unread_messages(user_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_unread_messages_user_peer_rank ON unread_messages(user_id, peer_id, msg_rank)")
@@ -130,7 +153,9 @@ def init_db() -> None:
             filename TEXT,
             file_size INTEGER,
             upload_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            expires_at DATETIME
+            expires_at DATETIME,
+            status TEXT NOT NULL DEFAULT 'ready',
+            content_sha256 TEXT
         )
     """)
 
@@ -173,6 +198,63 @@ def init_db() -> None:
             stripe_payment_intent_id TEXT
         )
     """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attachment_upload_sessions (
+            upload_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            client_request_id TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            encrypted_size INTEGER NOT NULL,
+            chunk_count INTEGER NOT NULL,
+            storage_label TEXT,
+            file_id TEXT,
+            ciphertext_sha256 TEXT,
+            reserved_size INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME NOT NULL,
+            committed_at DATETIME,
+            UNIQUE(owner_id, client_request_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attachment_upload_chunks (
+            upload_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            chunk_size INTEGER NOT NULL,
+            chunk_sha256 TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (upload_id, chunk_index)
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attachment_upload_sessions_owner_state "
+        "ON attachment_upload_sessions(owner_id, state, expires_at)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attachment_upload_chunks_session "
+        "ON attachment_upload_chunks(upload_id, chunk_index)"
+    )
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS attachment_device_envelopes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            envelope_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            source_device_id TEXT NOT NULL,
+            target_device_id TEXT NOT NULL,
+            target_key_id TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME NOT NULL,
+            UNIQUE(user_id, target_device_id, envelope_id)
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attachment_device_envelopes_target "
+        "ON attachment_device_envelopes(user_id, target_device_id, id)"
+    )
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS licensed_servers (
@@ -366,6 +448,16 @@ def init_db() -> None:
         cursor.execute("ALTER TABLE sessions ADD COLUMN notification_key_version INTEGER DEFAULT 1")
     except Exception:
         pass
+    for column_name in (
+        "attachment_public_key TEXT",
+        "attachment_key_id TEXT",
+        "attachment_capabilities TEXT",
+        "attachment_profile_updated_at DATETIME",
+    ):
+        try:
+            cursor.execute(f"ALTER TABLE sessions ADD COLUMN {column_name}")
+        except Exception:
+            pass
     try:
         # Deprecated: retained for existing DB compatibility only.
         cursor.execute("ALTER TABLE users ADD COLUMN fcm_token_updated_at DATETIME")
@@ -383,6 +475,18 @@ def init_db() -> None:
         cursor.execute("ALTER TABLE conversation_read_state ADD COLUMN updated_by_device TEXT")
     except Exception:
         pass
+    try:
+        cursor.execute("ALTER TABLE file_registry ADD COLUMN status TEXT NOT NULL DEFAULT 'ready'")
+    except Exception:
+        pass
+    try:
+        cursor.execute("ALTER TABLE file_registry ADD COLUMN content_sha256 TEXT")
+    except Exception:
+        pass
+
+    cursor.execute(
+        "UPDATE file_registry SET status = 'ready' WHERE status IS NULL OR status = ''"
+    )
 
     try:
         cursor.execute("ALTER TABLE server_licenses ADD COLUMN secret TEXT")

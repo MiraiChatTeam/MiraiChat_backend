@@ -122,6 +122,10 @@ def should_send_push_for_message(msg: dict) -> bool:
     if no_push:
         return False
 
+    protocol_kind = str(msg.get("protocol_kind") or "").strip().lower()
+    if protocol_kind == "attachment_lifecycle_v1":
+        return str(msg.get("protocol_event_type") or "").strip().lower() == "pending"
+
     push_type = str(msg.get("push_type") or msg_type or "").strip().lower()
 
     if msg_type in {
@@ -172,6 +176,11 @@ def send_fcm_push(
         "timestamp": ts,
         "nonce": n,
         "signature": "",
+        "excludeSessionHashes": [
+            hashlib.sha256(str(value).strip().encode()).hexdigest()
+            for value in (exclude_session_secrets or [])
+            if str(value or "").strip()
+        ],
     }
 
     try:
